@@ -1,0 +1,8 @@
+# AdGuard Home 配置 —— 复制为 agh.conf 并 chmod 600 后生效
+# 用途：MosDNS 自己的日志里 client 恒为 127.0.0.1（请求是本机转发过去的），
+#       所以面板用 (时间, 域名, 查询类型) 去 AGH 的 querylog 里反查真实客户端 IP。
+# 不配也能跑，只是「客户端」那一列拿不到真实 IP。
+
+AGH_URL=http://192.168.1.1:8080
+AGH_USER=admin
+AGH_PASS=

@@ -1,0 +1,17 @@
+# 登录认证配置 —— 复制为 auth.conf 并 chmod 600 后生效
+# ⚠️ 文件不存在 / AUTH_ENABLE != 1 / 字段不全 时，面板不启用认证（任何人可看）
+
+AUTH_ENABLE=1
+AUTH_USER=admin
+
+# 下面两个值请用 tools/dashboard-setpass 生成，不要手填
+#   AUTH_HASH   = PBKDF2(密码, salt) 的哈希串
+#   AUTH_SECRET = 会话 cookie 的 HMAC 签名密钥（随机串）
+AUTH_HASH=
+AUTH_SECRET=
+
+# 可选：局域网免登录。默认 0（内外网都要登录）。
+# ⚠️ 改成 1 之前务必读完 README 的「安全提醒」一节：
+#    如果面板挂在反向代理后面，服务端看到的来源 IP 可能是 127.0.0.1，
+#    这时「内网免登录」等于对全网放行。
+# AUTH_LAN_FREE=0

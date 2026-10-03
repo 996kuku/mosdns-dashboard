@@ -1,0 +1,36 @@
+# ---------- 运行时数据：绝对不要提交 ----------
+# logs.db 里是真实的 DNS 查询历史（谁在什么时候访问了什么域名），属于隐私
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs.db*
+baseline.json
+
+# ---------- 真实配置：只提交 *.example ----------
+auth.conf
+agh.conf
+ikuai.conf
+devices.conf
+
+# ---------- TLS 证书与私钥 ----------
+ssl/
+*.pem
+*.key
+*.crt
+*.csr
+
+# ---------- 第三方网站图标 ----------
+# 版权归各自站点所有，不进仓库；部署后用 tools/fetch-logos.py 现抓
+static/logo/*
+!static/logo/.gitkeep
+
+# ---------- Python / 编辑器 / 备份 ----------
+__pycache__/
+*.py[cod]
+*.bak*
+*.orig
+*.swp
+.vscode/
+.idea/
+.DS_Store

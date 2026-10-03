@@ -1,0 +1,87 @@
+#!/bin/bash
+# 设置 / 修改 MosDNS 仪表盘的登录账号密码
+# 用法: dashboard-setpass [-u 用户名] [-d]      -d = 关闭登录认证（内网可信时才用）
+# 直接跑会交互式提示输入新密码（不回显），特殊字符不会被 shell 吃掉。
+set -euo pipefail
+
+DIR=/opt/mosdns-dashboard
+CONF="$DIR/auth.conf"
+PY=/usr/bin/python3
+
+[ -w "$DIR" ] || { echo "需要 root 权限（$DIR 不可写）" >&2; exit 1; }
+
+USER_NAME=""
+DISABLE=0
+while getopts ":u:dh" opt; do
+  case "$opt" in
+    u) USER_NAME="$OPTARG" ;;
+    d) DISABLE=1 ;;
+    h) sed -n '2,5p' "$0"; exit 0 ;;
+    *) echo "用法: $0 [-u 用户名] [-d]" >&2; exit 2 ;;
+  esac
+done
+
+# 读现有配置
+OLD_USER="admin"; OLD_SECRET=""
+if [ -f "$CONF" ]; then
+  OLD_USER="$(sed -n 's/^AUTH_USER=//p' "$CONF" | head -1)"
+  OLD_SECRET="$(sed -n 's/^AUTH_SECRET=//p' "$CONF" | head -1)"
+fi
+[ -n "$USER_NAME" ] || USER_NAME="${OLD_USER:-admin}"
+[ -n "$OLD_SECRET" ] || OLD_SECRET="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+if [ "$DISABLE" = 1 ]; then
+  cp -a "$CONF" "$CONF.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  cat > "$CONF" <<EOF
+# MosDNS 仪表盘登录认证 —— 已关闭
+# 改回开启：跑一次 $0 即可
+AUTH_ENABLE=0
+AUTH_USER=$USER_NAME
+AUTH_SECRET=$OLD_SECRET
+EOF
+  chmod 600 "$CONF"
+  echo "已关闭登录认证（任何人可访问面板）。重启服务生效：systemctl restart mosdns-dashboard"
+  exit 0
+fi
+
+echo "MosDNS 仪表盘 —— 设置登录账号"
+echo "用户名: $USER_NAME"
+echo -n "新密码: "
+read -rs PW; echo
+echo -n "再输一次: "
+read -rs PW2; echo
+
+[ -n "$PW" ] || { echo "密码不能为空" >&2; exit 1; }
+[ "$PW" = "$PW2" ] || { echo "两次输入不一致" >&2; exit 1; }
+
+HASH="$(PW="$PW" "$PY" - <<'PYEOF'
+import base64, hashlib, os, sys
+pw = os.environ["PW"]
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200000)
+print("pbkdf2_sha256$200000$%s$%s" % (base64.b64encode(salt).decode(),
+                                      base64.b64encode(dk).decode()))
+PYEOF
+)"
+
+[ -f "$CONF" ] && cp -a "$CONF" "$CONF.bak.$(date +%Y%m%d-%H%M%S)"
+umask 077
+cat > "$CONF" <<EOF
+# MosDNS 仪表盘登录认证
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 密码用 PBKDF2-SHA256(200000 轮) 加盐哈希，无法反推明文；忘了就重跑 dashboard-setpass
+AUTH_ENABLE=1
+AUTH_USER=$USER_NAME
+AUTH_HASH=$HASH
+AUTH_SECRET=$OLD_SECRET
+EOF
+chmod 600 "$CONF"
+
+echo
+echo "已更新 $CONF"
+if systemctl is-active mosdns-dashboard >/dev/null 2>&1; then
+  systemctl restart mosdns-dashboard
+  sleep 1
+  systemctl is-active mosdns-dashboard >/dev/null && echo "服务已重启，登录生效"
+fi
+echo "登录页: https://<面板主机>:8088/login.html"

@@ -1,0 +1,7 @@
+# 统一用 LF。
+# 不加这个的话，Windows 上 core.autocrlf=true 会把 .sh 转成 CRLF，
+# 部署到 Linux 时 #!/bin/bash^M 直接报 "bad interpreter"，脚本全废。
+* text=auto eol=lf
+
+# 二进制不要做任何换行转换
+*.png binary

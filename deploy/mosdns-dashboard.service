@@ -1,0 +1,30 @@
+[Unit]
+Description=MosDNS Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mosdns-dashboard
+ExecStart=/usr/bin/python3 -u /opt/mosdns-dashboard/server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mosdns-dashboard
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# 可选：把环境变量写进 drop-in（/etc/systemd/system/mosdns-dashboard.service.d/env.conf）
+#
+# [Service]
+# Environment=MOSDNS_HOST=192.168.1.1
+# Environment=MOSDNS_SSH_KEY=/root/.ssh/id_ed25519_mosdns
+# Environment=DASH_PORT=8088
+# Environment=DASH_TLS_CERT=/opt/mosdns-dashboard/ssl/server.pem
+# Environment=DASH_TLS_KEY=/opt/mosdns-dashboard/ssl/server.key
+#
+# 改完执行：systemctl daemon-reload && systemctl restart mosdns-dashboard
+# ---------------------------------------------------------------------------

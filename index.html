@@ -1,0 +1,2970 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MosDNS 仪表盘</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6df6'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='%23fff' font-family='monospace'%3ED%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#0e1116; --panel:#161b22; --panel2:#1b2230; --border:#272e3b;
+  --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --green:#3fb950;
+  --red:#f85149; --orange:#d29922; --purple:#bc8cff; --cyan:#39c5cf;
+  --shadow:0 1px 3px rgba(0,0,0,.4);
+  --sel:#409EFF;   /* 主题蓝：文字选中高亮 / 按钮选中态，明暗主题共用 */
+  /* 时间范围按钮悬停：紫色块（暗色下用低饱和暗紫，底色太亮会看不清字） */
+  --hb:#382a52; --hbd:#a78bfa; --hb-tx:#ece4ff;
+  /* 示例域名/IP 按钮悬停：琥珀金块（就是「拦截查询」那档 --orange #D29922）。
+     金底亮度中等，配深色字对比度才够（白字只有约 2.5:1，偏糊）。 */
+  --exh:#d29922; --exhbd:#e8b23c; --extx:#161b22;
+}
+html[data-theme="light"]{
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#f6f8fa; --border:#d8dee6;
+  --text:#1f2328; --muted:#656d76; --accent:#0969da; --green:#1a7f37;
+  --red:#cf222e; --orange:#9a6700; --purple:#8250df; --cyan:#0f766e;
+  --shadow:0 1px 3px rgba(31,35,40,.12);
+  --hb:#f3e8ff; --hbd:#c084fc; --hb-tx:#6d28d9;
+  /* 浅色（白）主题下示例按钮悬停改走蓝色块 —— 白底上金底偏灰、不够精神。
+     用站点主题蓝 --sel(#409EFF)，配白字（蓝底白字对比度约 3.6:1，够用）；
+     暗色主题仍是金底（见上），两套主题各自成体系。 */
+  --exh:#409EFF; --exhbd:#409EFF; --extx:#ffffff;
+}
+*{box-sizing:border-box}
+/* ---- 文字选中高亮（主题蓝 #409EFF 底 + 白字） ----
+   注意 ::selection 和 ::-moz-selection 必须分开写两条，
+   合进一个选择器列表（a,::selection{...}）会让整条规则被浏览器丢弃。 */
+::selection{background:var(--sel);color:#fff}
+::-moz-selection{background:var(--sel);color:#fff}
+/* 输入框里的选中也用同一套，避免浏览器默认灰蓝色 */
+input::selection,textarea::selection{background:var(--sel);color:#fff}
+input::-moz-selection,textarea::-moz-selection{background:var(--sel);color:#fff}
+
+/* ---- 自定义鼠标样式（站点同款） ----
+   原样照抄站点写法：cursor:url(...) , 关键字 !important，不指定热点（用默认 0 0）。
+   两点必须注意：
+   1) 必须带 !important —— 本文件后面还有 .btn/.bar/.cp/.rb 等各自写的 cursor:pointer，
+      优先级相同但位置更靠后，不加 !important 会被它们覆盖成系统默认手型；
+   2) 不要另加热点坐标 —— 站点就是默认 (0,0)，改成 8 2 之类会让图标整体偏移。 */
+body{margin:0;background:var(--bg);color:var(--text);
+  font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;
+  cursor:url("static/mouse-normal1.png"), default !important}
+/* 站点原样的可点元素 + 面板特有的（.btn/.rb/.cp/.bar/.examples a/.qpschip/[onclick]）
+   可排序表头 .srt/.dsrt/.lsrt 也必须加进来，否则三处鼠标样式不一致。 */
+a,button,summary,select,[role="button"],label[for],
+.btn,.rb,.cp,.bar,.examples a,.qpschip,[onclick],#dt .dname,#dt button[data-ip],
+.srt,.dsrt,.lsrt{
+  cursor:url("static/mouse-link1.png"), pointer !important}
+/* 禁用态不暗示可点 */
+.btn:disabled,.rb:disabled{cursor:url("static/mouse-normal1.png"), default !important}
+/* 趋势图热区保持十字准星，方便对齐数据点 */
+.hov{cursor:crosshair !important}
+.wrap{max-width:1180px;margin:0 auto;padding:18px 18px 60px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:14px 18px;margin-bottom:16px;background:var(--panel);
+  border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}
+h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+.sub{color:var(--muted);font-size:12.5px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 0 3px rgba(63,185,80,.18);flex:none}
+.spacer{flex:1}
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:8px;padding:6px 12px;font-size:12.5px;cursor:pointer;
+  font-family:inherit;transition:.15s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.55;cursor:default}
+.card h2 .btn{margin-left:auto;font-size:11px;padding:2px 10px;line-height:1.6}
+.tag.warn{color:var(--orange);border-color:rgba(210,153,34,.45)}
+
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  padding:16px 18px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{font-size:14px;margin:0 0 14px;font-weight:650;display:flex;
+  align-items:center;gap:8px}
+.card h2 .tag{font-size:11px;font-weight:400;color:var(--muted);
+  background:var(--panel2);border:1px solid var(--border);
+  border-radius:20px;padding:1px 9px}
+
+/* ---- 查询区 ---- */
+.qbar{display:flex;gap:10px;flex-wrap:wrap}
+.qbar input{flex:1;min-width:260px;background:var(--panel2);color:var(--text);
+  border:1px solid var(--border);border-radius:8px;padding:10px 13px;
+  font-size:14px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}
+.qbar input:focus{border-color:var(--accent)}
+.qbar .btn{padding:10px 20px;font-size:13.5px;background:var(--accent);
+  color:#fff;border-color:var(--accent);font-weight:600}
+.qbar .btn:hover{opacity:.88;color:#fff}
+.examples{margin-top:9px;font-size:12px;color:var(--muted);display:flex;
+  gap:6px;flex-wrap:wrap;align-items:center}
+.examples a{color:var(--accent);text-decoration:none;cursor:pointer;
+  background:var(--panel2);border:1px solid var(--border);
+  border-radius:20px;padding:2px 10px}
+/* 悬停：整块变成琥珀金（#D29922），与时间范围按钮的"换底色"手感一致 */
+.examples a:hover{background:var(--exh);border-color:var(--exhbd);color:var(--extx)}
+
+#result{margin-top:16px}
+/* 空输入时的默认提示：样式低调，别喧宾夺主 */
+.qhint{padding:18px 16px;font-size:12.6px;line-height:1.75;color:var(--text);
+  background:var(--panel2);border:1px dashed var(--border);border-radius:10px}
+.qhint .cn{color:var(--muted)}
+.rbox{border:1px solid var(--border);border-radius:10px;background:var(--panel2);
+  padding:14px 16px}
+.rhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.iconwrap{width:56px;height:56px;border-radius:12px;background:var(--panel);
+  border:1px solid var(--border);display:flex;align-items:center;
+  justify-content:center;font-size:30px;flex:none;overflow:hidden}
+.iconwrap img{width:36px;height:36px;object-fit:contain}
+.rtitle{font-size:16px;font-weight:650;word-break:break-all}
+.rsub{font-size:12.5px;color:var(--muted);margin-top:2px}
+.flagbig{font-size:34px;line-height:1;flex:none}
+.badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.badge{font-size:11.5px;border-radius:20px;padding:2px 10px;
+  border:1px solid var(--border);background:var(--panel);color:var(--muted)}
+.badge.ok{color:var(--green);border-color:rgba(63,185,80,.4)}
+.badge.warn{color:var(--orange);border-color:rgba(210,153,34,.4)}
+.badge.bad{color:var(--red);border-color:rgba(248,81,73,.4)}
+.badge.info{color:var(--accent);border-color:rgba(88,166,255,.4)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+.kv{font-size:12.8px}
+.kv div{display:flex;justify-content:space-between;gap:10px;padding:4px 0;
+  border-bottom:1px dashed var(--border)}
+.kv div:last-child{border-bottom:none}
+.kv .k{color:var(--muted);flex:none}
+.kv .v{text-align:right;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace}
+.reclist{margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.4px}
+.reclist div{padding:3px 0;border-bottom:1px dashed var(--border)}
+.reclist div:last-child{border-bottom:none}
+.reclist .t{color:var(--purple);display:inline-block;min-width:56px}
+.reclist .v{color:var(--text);word-break:break-all}
+.reclist .cn{color:var(--muted)}
+.sect{font-size:12px;color:var(--muted);margin:14px 0 2px;font-weight:600;
+  letter-spacing:.3px}
+.mosd{background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:10px 12px;margin-top:10px;font-size:12.6px}
+.err{color:var(--red);font-size:12.5px;margin-top:10px}
+.spin{color:var(--muted);font-size:12.5px;margin-top:12px}
+
+/* ---- 概览 ----
+   8 个 grid item（2026-10-03 重排后的固定槽位）：
+     ① 总查询数  ② 缓存命中率  ③ 缓存记录数  ④ 拦截查询
+     ⑤ 平均延迟  ⑥ QPS 卡      ⑦ 本地 hosts  ⑧ 拦截占比
+   其中第 6、7 格的内容会随区间变化，且**两张卡的落位正好互换**：
+     实时 → 第 6 格「当前 QPS」、第 7 格「本地 hosts」
+     历史 → 第 6 格「当前 QPS」、第 7 格「平均 QPS」
+   ⚠️ 定位一律用 nth-child，不要用 .qpscard —— QPS 卡只有一张但**位置会变**，
+      靠 class 选会在以后再次调序时悄悄错位。 */
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.kpi{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+/* >1100px（4 列）：8 张卡全部自然流排布（2026-10-03 重排后改为如此）。
+   ⚠️ 这里**曾经**给第 7、8 格做实时/历史两套对调，目的是让带呼吸点的「当前 QPS」恒在最右 col4。
+   但用户重排后 QPS 卡已移到第 6 格、第 8 格变成普通卡，「第 7、8 格都是 QPS 卡」的前提没了，
+   再对调会把「拦截占比」硬塞到第 3 列 —— 布局反而错乱。故改成自然流。
+   以后真要精确控制某一格，仍然用 grid-column:N + grid-row:N 显式钉住。 */
+@media(min-width:1101px){
+  .kpis>.kpi:nth-child(7){grid-column:auto;grid-row:auto}
+  .kpis>.kpi:nth-child(8){grid-column:auto;grid-row:auto}
+}
+/* 901~1100px（3 列）：自然流排布即可 */
+@media(min-width:901px) and (max-width:1100px){
+  .kpis{grid-template-columns:repeat(3,1fr)}
+  .kpis>.kpi:nth-child(7){grid-column:auto;grid-row:auto}
+  .kpis>.kpi:nth-child(8){grid-column:auto;grid-row:auto}
+}
+/* 手机 2 列：自然流排布，第 8 格自动补在末行 */
+@media(max-width:600px){
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .kpis>.kpi:nth-child(8){grid-column:auto;grid-row:auto}
+}
+/* 极窄屏 1 列：逐张往下排 */
+@media(max-width:360px){
+  .kpis{grid-template-columns:1fr}
+  .kpis>.kpi:nth-child(8){grid-column:auto}
+}
+.kpi .lab{font-size:11.5px;color:var(--muted)}
+.kpi .val{font-size:22px;font-weight:680;margin-top:3px;letter-spacing:-.3px}
+.kpi .val small{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
+.kpi.g .val{color:var(--green)} .kpi.o .val{color:var(--orange)}
+.kpi.b .val{color:var(--accent)} .kpi.p .val{color:var(--purple)}
+/* ---- QPS 宽卡（2026-10-03 重排后落在第 6 格，原第 8 格）----
+   它比普通卡多一行 .qsub 小字、lab 里多一个呼吸点，结构不一样，
+   所以在 renderKpis() 里由 {qps:true} 占位单独渲染，不参与 items 的普通卡循环。
+   各断点下的落位见文件下方的响应式段落。 */
+.kpi.qpscard .lab{display:flex;align-items:center;gap:7px}
+.kpi.qpscard .qdot{width:7px;height:7px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 0 3px rgba(63,185,80,.16);animation:qpspulse 2s ease-in-out infinite}
+.kpi.qpscard:not(.live) .qdot{display:none}     /* 历史区间是平均值，不是瞬时值，去掉呼吸点 */
+.kpi.qpscard .val{font-variant-numeric:tabular-nums}
+.kpi.qpscard.live .val{color:var(--green)}
+/* 历史区间会同时出现两张 QPS 卡：绿色带呼吸点的是「当前」（此刻瞬时），
+   蓝色无点的是「平均」（区间均值）。用主色区分，避免并排时看混。 */
+.kpi.qpscard:not(.live) .val{color:var(--accent)}
+.kpi.qpscard .val small{font-size:13px}
+.kpi.qpscard .qsub{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.5}
+@keyframes qpspulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){ .kpi.qpscard .qdot{animation:none} }
+
+svg.chart{width:100%;height:auto;display:block}
+.tbox{position:relative}
+.hov{cursor:crosshair}
+.hov:hover{fill:rgba(127,127,127,.16)}
+.tip{position:absolute;display:none;pointer-events:none;z-index:5;
+  background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:8px 11px;font-size:12px;white-space:nowrap;
+  box-shadow:0 6px 18px rgba(0,0,0,.28);transform:translate(-50%,-100%)}
+.tip .tt{font-weight:650;margin-bottom:5px;font-variant-numeric:tabular-nums}
+.tip .row{display:flex;justify-content:space-between;gap:16px;line-height:1.7}
+.tip .row span:last-child{font-variant-numeric:tabular-nums}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px}
+
+/* ---- 条形榜 ---- */
+.bars{display:flex;flex-direction:column;gap:7px;
+  max-height:270px;overflow-y:auto;padding-right:6px}  /* 兜底，实际高度由 JS 按行数精确计算 */
+.bars::-webkit-scrollbar{width:8px}
+.bars::-webkit-scrollbar-track{background:transparent}
+.bars::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.bars::-webkit-scrollbar-thumb:hover{background:var(--muted)}
+.bars{scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.bar{display:flex;align-items:center;gap:10px;font-size:12.6px;
+  cursor:pointer;border-radius:6px;padding:1px 3px;margin:0 -3px;transition:background .12s}
+.bar:hover{background:var(--panel2)}
+.bar:hover .nm{color:var(--accent);text-decoration:underline dotted}
+/* 可点击复制的域名 */
+.cp{cursor:pointer;border-bottom:1px dotted transparent}
+.cp:hover{color:var(--accent);border-bottom-color:var(--accent)}
+/* 复制提示浮条 */
+/* z-index 400：必须高于日志详情弹窗（300），否则弹窗里点「复制域名」时提示被盖住 */
+#toast{position:fixed;left:50%;bottom:30px;z-index:400;
+  transform:translateX(-50%) translateY(10px);opacity:0;pointer-events:none;
+  background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  padding:9px 18px;border-radius:10px;font-size:13px;white-space:nowrap;
+  box-shadow:0 8px 26px rgba(0,0,0,.4);transition:opacity .18s,transform .18s}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.ok{border-color:var(--green)}
+#toast.no{border-color:var(--red)}
+.bar .rank{width:22px;color:var(--muted);font-size:11.5px;flex:none;text-align:right}
+.bar .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:ui-monospace,Menlo,Consolas,monospace}
+.bar .track{width:38%;flex:none;height:8px;background:var(--panel2);
+  border-radius:6px;overflow:hidden;border:1px solid var(--border)}
+.bar .fill{height:100%;border-radius:6px}
+.bar .cnt{width:66px;text-align:right;color:var(--muted);flex:none;
+  font-variant-numeric:tabular-nums}
+
+/* ---- 设备表 ---- */
+#dt{width:100%;border-collapse:collapse;font-size:12.3px}
+#dt th{font-weight:600;padding:7px 9px;border-bottom:1px solid var(--border);
+  text-align:left;color:var(--muted);font-size:11.5px;white-space:nowrap;
+  background:var(--panel2);position:sticky;top:0;z-index:1}
+#dt td{padding:6px 9px;border-bottom:1px solid var(--border);vertical-align:middle}
+/* 设备表滚动容器：可视高度由 JS 按 DEV_ROWS 行反算，多出来的滚动查看 */
+.dtwrap{overflow:auto;max-height:400px;border:1px solid var(--border);
+  border-radius:10px;margin-bottom:8px}
+#dt tr:last-child td{border-bottom:none}
+#dt tr:hover td{background:var(--panel2)}
+#dt .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+#dt .num{text-align:right;font-variant-numeric:tabular-nums}
+/* 数字列用 flex 装内容：占比条 / 徽章就不会参与行内盒的基线计算，
+   否则 overflow:hidden 的 inline-block 会把整行撑高十几像素 */
+#dt td.num,#dt td.act{padding-top:0;padding-bottom:0}
+#dt .dcell{display:flex;align-items:center;justify-content:flex-end;
+  gap:7px;min-height:31px}
+#dt .dcell.act{justify-content:center}
+/* 真实客户端日志表格 */
+#at{width:100%;border-collapse:collapse;font-size:12.3px}
+#at th{font-weight:600;padding:7px 9px;border-bottom:1px solid var(--border);
+  text-align:left;color:var(--muted);font-size:11.5px;white-space:nowrap;
+  background:var(--panel2);position:sticky}
+#at td{padding:6px 9px;border-bottom:1px solid var(--border);vertical-align:middle}
+/* 逐列筛选行：跟着表头一起吸顶（top 由 JS 按首行实际高度设置） */
+#at thead tr:first-child th{top:0;z-index:2}
+/* 可排序表头：点一下升序、再点降序、第三下恢复 */
+/* 三张表的表头排序共用一套样式与交互（升序 → 降序 → 恢复默认）。
+   #at  = 客户端查询日志（class .srt）
+   #dt  = 局域网设备（class .dsrt）
+   #lt  = 最近解析日志（class .lsrt）
+   注意：这些选择器必须并列写在一起，别只改其中一个而漏掉另一个。 */
+#at th.srt,#dt th.dsrt,#lt th.lsrt{cursor:pointer;user-select:none;transition:color .12s}
+#at th.srt:hover,#dt th.dsrt:hover,#lt th.lsrt:hover{color:var(--text)}
+/* 箭头：静态（⇅）与激活（↑↓）都是绿色，靠透明度 + 字重区分当前排的是哪一列 ——
+   静态用 .55 的淡绿（整排都鲜绿会太花），激活态 opacity:1 且加粗。
+   颜色用 var(--green) 跟随主题：深色 #3fb950 / 浅色 #1a7f37。 */
+#at th.srt .ar,#dt th.dsrt .ar,#lt th.lsrt .ar{opacity:.55;color:var(--green);
+  font-size:9.5px;margin-left:3px;display:inline-block;width:9px;text-align:center}
+#at th.srt.on,#dt th.dsrt.on,#lt th.lsrt.on{color:var(--accent)}
+/* 升序/降序**激活态**的箭头：绿色 + 加粗（三张表的 .srt/.dsrt/.lsrt 统一）。
+   未激活的 ⇅ 保持灰色半透明 —— 那是「这一列可排序」的提示，
+   全变绿会让每张表所有列同时亮起来，反而看不出当前到底按哪列排。 */
+#at th.srt.on .ar,#dt th.dsrt.on .ar,#lt th.lsrt.on .ar{
+  opacity:1;color:var(--green);font-weight:900}
+#at thead tr.filters th{top:32px;z-index:1;padding:3px 5px}
+#at .fin{width:100%;box-sizing:border-box;font:inherit;font-size:11.5px;
+  padding:2px 5px;border:1px solid var(--border);border-radius:6px;
+  background:var(--panel);color:var(--text);min-width:0}
+#at .fin:focus{outline:none;border-color:var(--accent)}
+#at .fin::placeholder{color:var(--muted)}
+#at tr:hover td{background:var(--panel2)}
+#at .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.atwrap{overflow:auto;max-height:440px;border:1px solid var(--border);border-radius:10px}
+/* 设备表里的迷你占比条 */
+#dt .dbar{display:inline-block;width:52px;height:5px;border-radius:3px;
+  background:var(--panel2);overflow:hidden;vertical-align:middle;margin-right:7px}
+#dt .dfill{display:block;height:100%;background:var(--accent);border-radius:3px}
+#dt .dnum{font-variant-numeric:tabular-nums}
+#dt .btn.mini{padding:1px 8px;font-size:11px;border-radius:6px;line-height:1.7}
+/* 表格里的灰色占位文字 */
+#dt .cn,#at .cn{color:var(--muted)}
+
+/* ---- 时间范围切换 ---- */
+.rngbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:11px 16px;margin-bottom:16px}
+/* 说明文字（#rng-note）固定独占第二行 —— 2026-10-03 用户报"点区间页面会跳"。
+   原因：它原来跟着按钮在同一行靠右，文案一变长（实时那句短、历史那句带数据点和起始时间，长一截）
+   就自动折行/取消折行 → 整栏高度在 1 行↔2 行之间来回变 → 点一下跳一下。
+   flex-basis:100% 让它永远另起一行；再配 nowrap + 省略号，
+   防止长文案在同一行内二次折行（那会让高度再变一次）。
+   ⚠️ 窄屏必须放开 nowrap：手机宽度下 40 多字的说明一行装不下，
+     硬 nowrap 会把关键信息截成省略号。 */
+.rngbar>#rng-note{flex-basis:100%;min-width:0;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+@media(max-width:700px){
+  .rngbar>#rng-note{white-space:normal;overflow:visible;text-overflow:clip}
+}
+.rng{display:flex;gap:6px;flex-wrap:wrap}
+.rb{background:var(--panel2);color:var(--muted);border:1px solid var(--border);
+  border-radius:7px;padding:4px 12px;font-size:12px;cursor:pointer;
+  font-family:inherit;transition:.15s;white-space:nowrap}
+/* 选中态：蓝底白字。
+   ⚠️ 这条不能少 —— 「实时（MosDNS 累计）」默认就是选中态，靠它才有蓝底。
+   曾经因为改悬停样式时被整段覆盖掉，导致「实时」底色变灰。 */
+.rb.on{background:var(--sel);border-color:var(--sel);color:#fff}
+/* 悬停：所有按钮统一变紫底（--hb/--hbd/--hb-tx，含已选中的那个；鼠标移开即恢复）。
+   权重与上面的 .rb.on 相同（都是 0-2-0），靠写在它后面来覆盖，所以顺序不能动。 */
+.rb:hover{background:var(--hb);border-color:var(--hbd);color:var(--hb-tx)}
+.rb:disabled{opacity:.45;cursor:default}
+.rb:disabled:hover{background:var(--panel2);border-color:var(--border);color:var(--muted)}
+
+/* 时间范围栏里的「当前 QPS」小框。
+   实时视图左侧有个呼吸小圆点（.qd），提示这是此刻的瞬时值；
+   切到历史区间会自动变成「平均 QPS」并隐藏小圆点（.live 去掉）。 */
+.qpschip{display:inline-flex;align-items:center;gap:6px;flex:none;
+  background:var(--panel2);border:1px solid var(--border);border-radius:7px;
+  padding:4px 10px;font-size:12px;color:var(--muted);cursor:pointer;
+  transition:border-color .15s,color .15s,background .15s;
+  font-variant-numeric:tabular-nums}
+.qpschip:hover{border-color:var(--accent);color:var(--text)}
+.qpschip .ql{white-space:nowrap}
+.qpschip b{font-size:13px;font-weight:660;color:var(--text)}
+.qpschip .qd{width:6px;height:6px;border-radius:50%;background:var(--green);flex:none;
+  box-shadow:0 0 0 3px rgba(63,185,80,.16);animation:qpspulse 2s ease-in-out infinite}
+.qpschip:not(.live) .qd{display:none}
+.qpschip.live b{color:var(--green)}
+@keyframes qpspulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){ .qpschip .qd{animation:none} }
+
+/* ---- 表格 ---- */
+.tblwrap{overflow:auto;max-height:440px;border:1px solid var(--border);border-radius:10px}
+table{width:100%;border-collapse:collapse;font-size:12.3px}
+th{position:sticky;top:0;background:var(--panel2);text-align:left;
+  padding:8px 10px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border);
+  white-space:nowrap;z-index:1}
+td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+tr:hover td{background:var(--panel2)}
+td.d{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;max-width:280px}
+td.time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+td.ans{color:var(--muted);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.6px}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.filter{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+
+/* ---- 上游服务器表 ----
+   10 列并排，必须 table-layout:fixed 才能让 th 的 width 生效（auto 布局下浏览器
+   按内容自己分配，实测给的宽度会被忽略）；配 min-width 让窄屏转横向滚动而不是压缩。
+   ⚠️ 上游地址可能很长（https://dns.cloudflare.com/dns-query），列内容要允许折行。 */
+.upwrap{overflow:auto;max-height:360px;border:1px solid var(--border);border-radius:10px}
+#upt{table-layout:fixed;min-width:1000px}
+#upt th:nth-child(1){width:196px}   /* 主机 */
+#upt th:nth-child(2){width:152px}   /* IP   */
+#upt th:nth-child(3){width:56px}    /* 端口 */
+#upt th:nth-child(4){width:76px}    /* 类型 */
+#upt th:nth-child(5){width:76px}    /* 安全性 */
+#upt th:nth-child(6){width:84px}    /* 状态 */
+#upt th:nth-child(7){width:78px}    /* 成功率 */
+#upt th:nth-child(8){width:88px}    /* 平均时间 */
+#upt th:nth-child(9){width:96px}    /* 总查询次数 */
+#upt th:nth-child(10){width:96px}   /* 总成功次数 */
+#upt td{overflow:hidden}
+/* 主机列：去掉等宽/小字，字号/粗细与「端口」列保持一致。
+   端口列继承全局 table{font-size:12.3px}，所以 .uphost 不再单独设字号，
+   直接继承 12.3px/400，和 "443" 完全一致。
+   IP 列仍用等宽 12px 便于地址比对。 */
+#upt td:nth-child(1){word-break:break-all}
+#upt td:nth-child(2){word-break:break-all;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+#upt .uphost{display:block;font-weight:400}
+/* .upaddr 已弃用，tag 不再显示在主机列下方 */
+/* 数字列居中，跟表头对齐 */
+#upt th:nth-child(3),#upt th:nth-child(4),#upt th:nth-child(5),
+#upt th:nth-child(6),#upt th:nth-child(7),#upt th:nth-child(8),
+#upt th:nth-child(9),#upt th:nth-child(10),
+#upt td:nth-child(3),#upt td:nth-child(4),#upt td:nth-child(5),
+#upt td:nth-child(6),#upt td:nth-child(7),#upt td:nth-child(8),
+#upt td:nth-child(9),#upt td:nth-child(10){text-align:center}
+#upt .upnum{font-variant-numeric:tabular-nums}
+/* 状态 / 安全性 的语义色。用 var(--*) 跟随主题，别写死颜色 */
+#upt .st-ok{color:var(--green)}
+#upt .st-warn{color:var(--orange)}
+#upt .st-bad{color:var(--red)}
+#upt .st-idle{color:var(--muted)}
+#upt .proto-doh,#upt .proto-dot,#upt .proto-doq{color:var(--accent)}
+#upt .sec-yes{color:var(--green)}
+#upt .sec-no{color:var(--muted)}
+#upt .h3tag{color:var(--purple);font-size:11px}
+#upt .h2tag{color:var(--muted);font-size:11px}
+#upt .upmore{color:var(--muted);font-size:11px}
+#upt .uphint{color:var(--muted);font-size:11px;display:block;margin-top:2px}
+#upt .upempty{color:var(--muted);text-align:center;padding:18px 0}
+.filter input{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:8px;padding:6px 11px;font-size:12.5px;outline:none;min-width:220px}
+.filter input:focus{border-color:var(--accent)}
+footer{color:var(--muted);font-size:12px;text-align:center;margin-top:26px;line-height:1.8}
+footer a{color:var(--muted);text-decoration:none;
+  border-bottom:1px solid rgba(127,140,160,.45);transition:color .15s,border-color .15s}
+footer a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+.fmeta{margin-top:9px;padding-top:8px;border-top:1px solid var(--border);font-size:12px}
+.fmeta .sep{margin:0 7px;opacity:.55}
+
+/* ================= 查询日志详情弹窗 =================
+   点「最近解析日志」任意一行弹出。字段全部来自 /api/logs 的那条记录，
+   没有的字段显示「-」，不编造（比如 TTL：MosDNS 的日志里根本没这个字段）。 */
+.qmodal{position:fixed;inset:0;z-index:300;display:none;overflow:auto;
+  background:rgba(0,0,0,.5);padding:22px}
+/* 弹窗垂直居中（原来 display:block + margin:0 auto 是「贴顶部」，
+   内容一多就顶到屏幕最上面）。用 flex + margin:auto：
+   内容比视口矮 → 上下左右都居中；内容比视口高 → auto margin 自动归零、
+   退回顶部对齐并交给 .qmodal 的 overflow:auto 滚动。
+   ⚠️ 不能用 align-items:center —— 那会在内容超高时把顶部裁掉且滚不上去。 */
+.qmodal.on{display:flex}
+.qbox{width:min(720px,100%);margin:auto;background:var(--panel);
+  border:1px solid var(--border);border-radius:12px;
+  box-shadow:0 14px 44px rgba(0,0,0,.42);animation:qpop .15s ease-out;
+  /* 高度封顶 = 视口 - 上下 padding(22*2)，超出部分让 .qbody 内部滚动，
+     这样表头和「关闭」按钮始终露在外面，不用滚到底才能关。 */
+  max-height:calc(100vh - 44px);display:flex;flex-direction:column;overflow:hidden}
+@keyframes qpop{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){ .qbox{animation:none} }
+/* flex 列向容器里，.qbody 要能收缩才会滚动 —— 默认 min-height:auto 会被内容顶开，
+   导致 max-height 失效、整个弹窗溢出视口。 */
+.qbody{padding:15px 20px 8px;overflow:auto;min-height:0}
+.qhead,.qfoot{flex:none}
+.qhead{padding:15px 20px 14px;border-bottom:1px solid var(--border)}
+.qtitle{font-size:12px;color:var(--muted)}
+.qline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:7px}
+.qdname{font-size:17px;font-weight:660;word-break:break-all;flex:1 1 auto;min-width:0}
+.qtype{font-size:11.5px;color:var(--muted);border:1px solid var(--border);
+  border-radius:4px;padding:1px 7px;flex:none}
+.qmeta{margin-left:auto;display:flex;align-items:center;gap:9px;flex:none}
+.qms{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:13px 18px}
+.qg .k{font-size:11.5px;color:var(--muted);margin-bottom:2px}
+.qg .v{font-size:13.5px;word-break:break-all}
+#qm-time{white-space:nowrap}          /* 时间别被折断成「2026-10-0 / 3」 */
+.qsect{margin-top:16px;padding-top:13px;border-top:1px solid var(--border);
+  font-size:13.5px;font-weight:650;display:flex;align-items:center;gap:8px}
+.qcnt{font-size:11.5px;font-weight:400;color:var(--muted);
+  border:1px solid var(--border);border-radius:4px;padding:0 6px}
+.qans{margin:8px 0 10px}
+.qans .qr{display:flex;align-items:baseline;gap:10px;padding:6px 0;
+  border-bottom:1px solid var(--border)}
+.qans .qr:last-child{border-bottom:none}
+.qans .qt2{font-size:11px;color:var(--muted);border:1px solid var(--border);
+  border-radius:4px;padding:1px 7px;flex:none;min-width:58px;text-align:center}
+.qans .qv{font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:12.5px;word-break:break-all}
+.qempty{color:var(--muted);font-size:12.5px;padding:6px 0}
+/* ---------- 设备命名弹窗 ----------
+   原来用的是浏览器原生 `prompt()`：位置和样式全由浏览器决定，根本改不了居中。
+   这里换成自定义弹窗，直接复用 .qmodal/.qbox 那套自适应居中（flex + margin:auto），
+   只是把宽度收窄成对话框尺寸。 */
+.nbox{width:min(430px,100%)}
+.nf{margin:2px 0 0}
+.nl{display:block;font-size:11.5px;color:var(--muted);margin-bottom:5px}
+/* ⚠️ 输入框 font-size 必须 ≥16px —— iOS 上小于 16px 时聚焦会自动放大整个页面 */
+.nin{width:100%;box-sizing:border-box;font:inherit;font-size:16px;
+  padding:9px 11px;background:var(--panel2);color:var(--text);
+  border:1px solid var(--border);border-radius:8px;outline:none}
+.nin:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.18)}
+.nhint{margin-top:10px;font-size:11.5px;color:var(--muted);line-height:1.6}
+/* ---------- 清除重计确认弹窗 ----------
+   原来用的是浏览器原生 confirm() + 失败时的 alert()：白底、系统字体、位置由浏览器决定
+   （通常贴在窗口顶部，跟页面完全脱节），按钮文案也改不了，在深色面板上非常突兀。
+   这里换成自定义弹窗，复用 .qmodal/.qbox 那套自适应居中。 */
+.cbox{width:min(470px,100%)}
+.ctext{margin:0 0 10px;font-size:13.5px;line-height:1.7;color:var(--text)}
+.ctext strong{color:var(--orange)}
+.clist{margin:0 0 12px;padding-left:18px;font-size:12.5px;
+  color:var(--muted);line-height:1.75}
+.clist li{margin-bottom:3px}
+/* 破坏性操作要用红底按钮，跟「保存」那类蓝色 primary 明确区分开。
+   权重 0-3-0，能盖住前面 0-2-0 的 .btn:hover{border-color:var(--accent)}。 */
+.btn.danger{background:var(--red);border-color:var(--red);color:#fff;font-weight:600}
+.btn.danger:hover{border-color:var(--red);color:#fff;opacity:.88}
+.btn.danger:disabled{opacity:.55}
+/* 应答被服务端截断时的如实提示：不假装完整，也不静默少显示 */
+.qtrunc{margin-top:8px;padding:7px 9px;border-radius:6px;font-size:11.5px;line-height:1.55;
+  color:var(--orange);background:rgba(255,152,0,.09);border:1px solid rgba(255,152,0,.28)}
+.qfoot{padding:13px 20px;border-top:1px solid var(--border);
+  display:flex;justify-content:flex-end;gap:9px}
+.qfoot .btn{padding:8px 18px;font-size:13px}
+.qfoot .btn.primary{background:var(--accent);border-color:var(--accent);
+  color:#fff;font-weight:600}
+.qfoot .btn.primary:hover{opacity:.88;color:#fff}
+/* 整行可点：给出悬停反馈，并让指针变成手型 */
+#lt tr.lrow{cursor:url("static/mouse-link1.png"), pointer !important}
+#lt tr.lrow:hover td{background:var(--panel2)}
+/* ---- #lt 列宽 ----
+   加了「客户端」列后 8 列并排，浏览器自动布局会把域名列挤到极窄；
+   再叠加通用的 td.d{max-width:280px;word-break:break-all}，
+   域名就被逐字符折成「tim / e.a / ppl / e.c / om」竖排。这里显式给定各列宽度，
+   并把 td.d 的 max-width 放开，让域名正常单行显示。 */
+/* ⚠️ 必须配 table-layout:fixed —— 默认的 auto 布局下浏览器会忽略 th 的 width、
+   按内容长度自行分配（实测「上游」列反而比「域名」列宽）。fixed 才会严格按下面的宽度来。
+   min-width:900px 保证窄屏下是横向滚动，而不是把 8 列等比压缩到看不清。 */
+#lt{table-layout:fixed;min-width:900px}
+#lt th:nth-child(1){width:72px}      /* 时间 */
+#lt th:nth-child(2){width:176px}     /* 客户端：两行（设备名 / IP），见下面的 td.cli */
+#lt th:nth-child(3){width:260px}     /* 域名：不能缩到 236px —— 实测
+                                        android.clients.google.com（26 字符）会被
+                                        word-break:break-all 折成「…google.c / om」。
+                                        260px 才能容纳 30 字符左右的三级域名。 */
+#lt th:nth-child(4){width:52px}      /* 类型 */
+#lt th:nth-child(5){width:92px}      /* 状态 */
+#lt th:nth-child(6){width:110px}     /* 上游 */
+#lt th:nth-child(7){width:70px}      /* 耗时 */
+/* 第 8 列（解析结果）不设宽度，自动吃掉剩下的空间 */
+#lt td.d{max-width:none}
+/* 上游列：DoH 地址很长（https://dns.google/dns-query），折行后不能溢出到
+   隔壁「耗时」列 —— 截图实测过 `https://dns.goog` 后面直接叠上 `795.49ms`。
+   td 默认 overflow:visible，URL 折行后宽度会顶出列框。
+   修法：单行显示 + 省略号，完整地址靠 title 悬停看（上游本来就是排查时对照用的）。 */
+#lt td.u{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:0}
+/* 客户端列分两行：第一行设备名（超长省略号，title 兜底），第二行 IP + 标注。
+   单行写法实测要 200px+（「办公电脑 (192.168.1.100)」），
+   「客厅摄像头 (192.168.1.54)」更是要 270px+；
+   而用户要看的关键信息恰好是 IP —— 单行只能截成「192.168...」，
+   要么就得把域名/解析结果两列挤没。拆两行后 176px 就能完整显示 IP。
+   注意 .cip 是 nowrap：加了「等N台」后若仍超宽，宁可省略号裁掉也不能撑破列
+   （td 默认 overflow:visible，不设 hidden 会顶穿表格）。 */
+#lt td.cli{white-space:normal;line-height:1.35;overflow:hidden}
+#lt td.cli .cnm{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* IP 一行：字号与颜色都跟「局域网设备」表(#dt)里的 IP 保持一致 ——
+   实测 #dt 的 IP 是 `--text`(rgb 230,237,243) + 12.3px，这边原来是
+   `--muted` 灰色 + 12.5px，看着像次要信息，和 #dt 对不上。
+   这里**不写 font-size**，让它继承 #lt 的 12.3px，与 #dt 天然同步；
+   颜色改用 --text。层次靠后面的「等N台 / 未识别」小标注来体现。 */
+#lt td.cli .cip{display:block;color:var(--text);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+/* 解析结果列：CNAME 链能很长且不带空格，不强制断行会把整个表格撑宽
+   （实测多出 36px → PC 上不该出现的横向滚动条）。 */
+#lt td.ans{word-break:break-all;font-size:12.5px}
+/* 上游 / 耗时 / 解析结果 这三列内容短、列宽有余量：
+   字号从表格默认 12px（解析结果原是 11.6px）提一档到 12.5px，并把文字居中。
+   表头也一起居中，否则「头左对齐 + 内容居中」看着会错位。 */
+#lt th:nth-child(6),#lt th:nth-child(7),#lt th:nth-child(8),
+#lt td:nth-child(6),#lt td:nth-child(7),#lt td:nth-child(8){text-align:center}
+#lt td:nth-child(6),#lt td:nth-child(7){font-size:12.5px}
+/* 类型列：A / AAAA 用琥珀色点出来（CNAME 等其它类型保持原色不动） */
+#lt td.qt-a{color:#d29922}
+/* 耗时：>60ms 红色、≤60ms 绿色，两种都加粗（阈值 60ms 是用户定的）。
+   #lt 与 #at 两张表都有这一列，必须并列写在一起，别只改一张。
+   颜色用 --red/--green 变量跟随主题：深色 #f85149/#3fb950，浅色 #cf222e/#1a7f37。 */
+#lt td.mshi,#at td.mshi{color:var(--red);font-weight:700}
+#lt td.mslo,#at td.mslo{color:var(--green);font-weight:700}
+/* 「解析结果」最多显示 2 行：一条查询的应答实测最多 26 条（CNAME 链），
+   全展开会把行高撑到 85px，列表几乎没法扫。裁成 2 行 + 悬停 title 看全文
+   + 点开弹窗看完整应答。
+   ⚠️ line-clamp 必须挂在内层 .ansin 上：直接给 td 设 display:-webkit-box
+   会把单元格从 table-cell 变成 box，table-layout:fixed 的列宽分配就全废了。 */
+#lt td.ans .ansin{display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:2;overflow:hidden}
+#lt td.ans .ansin .cn{color:var(--muted);font-size:11px}
+/* 客户端列的两个标注：
+   .amb  = 同秒多台设备（橙色）；.src = 数据来源说明（灰色，只在弹窗里用）。
+   两个都是「如实标注」，避免把推断值当成 MosDNS 直接给的数值。 */
+.amb{color:var(--orange);font-size:10.5px;margin-left:2px;white-space:nowrap}
+.amb.off{color:var(--muted)}
+.src{color:var(--muted);font-size:10.5px;margin-left:2px;white-space:nowrap;
+  border:1px solid var(--border);border-radius:3px;padding:0 5px}
+.src.off{opacity:.85}
+@media(max-width:600px){
+  .qmodal{padding:10px}
+  /* 手机端 padding 只有 10px，弹窗高度上限要跟着改，否则会比屏幕高 24px */
+  .qbox{max-height:calc(100vh - 20px)}
+  /* 手机用单列：两列时「10:42:29（2026-10-03）」这种长度会被折断成
+     「2026-10-0 / 3」，很难看；单列宽度足够，也更易读。 */
+  .qgrid{grid-template-columns:1fr;gap:11px}
+  .qdname{font-size:15.5px}
+  .qmeta{margin-left:0;width:100%}
+  .qfoot .btn{flex:1 1 0;padding:10px}
+}
+
+/* ===== 表格横向滚动提示（左右渐隐遮罩，滚到端点自动消失） ===== */
+.sxw{position:relative}
+.sxl,.sxr{position:absolute;top:1px;bottom:1px;width:26px;pointer-events:none;
+  opacity:0;transition:opacity .18s;z-index:4;border-radius:10px}
+.sxl{left:1px;background:linear-gradient(270deg,transparent,var(--panel))}
+.sxr{right:1px;background:linear-gradient(90deg,transparent,var(--panel))}
+
+/* ================= PC + 移动端 响应式适配 ================= */
+/* 平板 / 小笔记本 */
+@media(max-width:900px){
+  .wrap{padding:14px 12px 48px}
+  .card{padding:14px 15px;margin-bottom:13px}
+  header{padding:12px 14px;gap:10px}
+  /* 关键：grid 子项默认 min-width:auto，会被 .bar 里的固定宽度（rank 22 + track 38%
+     + cnt 66）顶出 min-content 宽度，单列时把整个页面撑宽到 521px。必须显式归零。 */
+  .grid2>*{min-width:0}
+}
+/* 手机：断点定在 600，覆盖 iPhone / 安卓主流（360~430）与折叠屏展开前 */
+@media(max-width:600px){
+  .wrap{padding:12px 10px 40px}
+  .card{padding:13px 12px;margin-bottom:12px;border-radius:10px}
+  .card h2{font-size:13.5px;margin-bottom:12px;flex-wrap:wrap;gap:6px}
+  /* 标题里的按钮换行后不要被 margin-left:auto 顶到最右 */
+  .card h2 .btn{margin-left:0;font-size:11px;padding:5px 10px}
+
+  /* 顶部栏：点 + 标题一行，4 个按钮换行平分第二行 */
+  header{padding:12px;gap:8px;flex-wrap:wrap}
+  h1{font-size:15.5px}
+  /* flex-basis:100% + height:0 —— 撑出一条 0 高度的全宽行，强制按钮换行 */
+  header .spacer{flex:0 0 100%;height:0;margin:0;padding:0}
+  header .btn{flex:1 1 0;min-width:0;padding:9px 4px;font-size:12px}
+
+  /* 查询区：输入框与按钮各占一行，触控更稳 */
+  .qbar{flex-direction:column;gap:8px}
+  .qbar input{flex:none;width:100%;min-width:0;font-size:16px}  /* 16px 防 iOS 聚焦自动放大 */
+  .qbar .btn{width:100%;padding:12px;font-size:14px}
+  .examples{font-size:11.5px;gap:5px}
+  .examples a{padding:4px 9px}
+
+  /* KPI：缩小内边距让一屏能多看几个（列数与 QPS 卡落位见文件上方的响应式段落） */
+  .kpi{padding:10px 11px}
+  .kpi .val{font-size:19px}
+  .kpi.qpscard .val small{font-size:12px}
+  .kpi.qpscard .qsub{font-size:11px;margin-top:5px}
+
+  /* 时间范围按钮：加大触控面积（移动端规则要写在 .rb.on 之后才能覆盖选中态） */
+  .rngbar{gap:8px}
+  .rb{padding:9px 13px;font-size:12.5px}
+  .rb.on{background:var(--sel);border-color:var(--sel);color:#fff}
+  .rb:hover{background:var(--hb);border-color:var(--hbd);color:var(--hb-tx)}
+  /* QPS 小框：与按钮同高同圆角，触控面积也放大到 36px */
+  .qpschip{padding:9px 11px;font-size:12.5px}
+  .qpschip b{font-size:14px}
+
+  /* 筛选栏：输入框独占一行，按钮平分下一行 */
+  .filter{gap:7px}
+  .filter input{flex:none;width:100%;min-width:0;font-size:16px}
+  .filter .btn{flex:1 1 0;min-width:0;padding:9px 6px;font-size:12.5px}
+  .filter .sub{flex:1 0 100%}
+
+  /* 表格：字号与内边距收紧，容器高度改用视口比例，小屏也别占满整屏 */
+  #dt,#at,#lt{font-size:12px}
+  #dt th,#at th,#dt td,#at td{padding:6px 7px}
+  .dtwrap,.atwrap,.tblwrap,.upwrap{max-height:min(440px,58vh)}
+  #at .fin{min-height:28px;font-size:12px}
+  .bar{font-size:12.2px;gap:7px}
+  .bar .cnt{width:56px}
+  .bar .track{width:32%}
+  .legend{font-size:11.5px;gap:10px}
+  footer{font-size:11.5px;margin-top:20px}
+}
+/* 极窄屏（360 及以下）：KPI 改单列，避免数字被压成两行 */
+@media(max-width:360px){
+  .bar .track{width:28%}
+}
+code{background:var(--panel2);border:1px solid var(--border);border-radius:5px;
+  padding:1px 6px;font-size:11.5px}
+.note{font-size:12px;color:var(--muted);margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="dot" id="dot"></span>
+  <div>
+    <h1>MosDNS 仪表盘 <span class="sub" id="h-host"></span>
+      <span class="tag" id="tag-live" style="margin-left:6px"></span>
+      <span class="tag warn" id="tag-since" style="margin-left:6px;display:none"></span></h1>
+    <div class="sub" id="h-sync"></div>
+  </div>
+  <div class="spacer"></div>
+  <button class="btn" id="restore" style="display:none">恢复累计</button>
+  <button class="btn" id="refresh">立即刷新</button>
+  <button class="btn" id="theme">切换主题</button>
+  <button class="btn" id="logout" title="清除登录状态">登出</button>
+</header>
+
+<!-- ========== 域名 / IP 查询 ========== -->
+<div class="card">
+  <h2>域名 / IP 查询 <span class="tag">实时</span></h2>
+  <div class="qbar">
+    <input id="q" placeholder="输入域名（如 www.baidu.com）或 IP（如 223.5.5.5），回车查询" autocomplete="off">
+    <button class="btn" id="go">查询</button>
+  </div>
+  <div class="examples">
+    示例：
+    <a data-q="www.baidu.com">www.baidu.com</a>
+    <a data-q="www.google.com">www.google.com</a>
+    <a data-q="example.com">example.com</a>
+    <a data-q="223.5.5.5">223.5.5.5</a>
+    <a data-q="www.996wan.com">www.996wan.com</a>
+  </div>
+  <div id="result"></div>
+</div>
+
+<!-- ========== 上游服务器 ==========
+     清单来自路由器的 MosDNS 配置（forward 插件的 upstreams，配置了就一定列出来，
+     哪怕一次没用过）；统计来自本面板自己累积的日志库（logs 表）。
+     所以「清除重计」清空日志后这张表也会跟着归零，和面板其它统计语义一致。 -->
+<div class="card">
+  <h2>上游服务器 <span class="tag" id="up-tag">来自路由器 MosDNS 配置</span></h2>
+  <div class="upwrap">
+    <table id="upt">
+      <thead><tr>
+        <th>主机</th><th>IP</th><th>端口</th><th>类型</th><th>安全性</th>
+        <th>状态</th><th>成功率</th><th>平均时间</th><th>总查询次数</th><th>总成功次数</th>
+      </tr></thead>
+      <tbody id="up-body"><tr><td colspan="10" class="upempty">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="note" id="up-note"></div>
+</div>
+
+<!-- ========== 时间范围（控制下面的趋势图 + 两个 TOP 榜） ========== -->
+<div class="card rngbar">
+  <span class="sub" style="flex:none">时间范围</span>
+  <div class="rng" id="rng">
+    <button class="rb on" data-r="live">实时（MosDNS 累计）</button>
+    <button class="rb" data-r="today">今天</button>
+    <button class="rb" data-r="7d">近 7 天</button>
+    <button class="rb" data-r="30d">近 30 天</button>
+    <button class="rb" data-r="all">自建库以来</button>
+  </div>
+  <!-- 当前 QPS 小框：跟着时间范围走。实时 = MosDNS 此刻瞬时值；历史区间 = 区间平均值。
+       点框可复制数值，与页面上其它数字的交互保持一致。 -->
+  <span class="qpschip live" id="qpschip" title="点击复制">
+    <i class="qd"></i><span class="ql" id="qps-chip-lab">当前 QPS</span>
+    <b id="qps-chip-val">-</b>
+  </span>
+  <!-- 说明文字：独占第二行（不再用 .spacer 往右推，见 .rngbar>#rng-note 的说明）。
+       .spacer 已删除，避免它把第一行的空白撑开却没有任何内容。 -->
+  <span class="sub" id="rng-note"></span>
+</div>
+
+<!-- ========== 概览 ========== -->
+<div class="card">
+  <h2>运行概览 <span class="tag" id="kpi-tag"></span></h2>
+  <div class="kpis" id="kpis"></div>
+</div>
+
+<!-- ========== 24 小时趋势 ========== -->
+<div class="card">
+  <h2>查询趋势 <span class="tag" id="trend-tag">每小时</span>
+    <button class="btn" id="clr-trend" data-src="查询趋势与概览统计" data-scope="stats">清除重计</button></h2>
+  <div id="trend"></div>
+  <div class="legend">
+    <span><i style="background:var(--accent)"></i>总查询</span>
+    <span><i style="background:var(--cyan)"></i>缓存命中</span>
+    <span><i style="background:var(--red)"></i>拦截</span>
+  </div>
+</div>
+
+<!-- ========== TOP 榜 ========== -->
+<div class="grid2" style="margin-bottom:16px">
+  <div class="card" style="margin:0">
+    <h2>热门域名 TOP 50 <span class="sub" id="topd-cnt"></span>
+      <button class="btn" id="clr-top" data-src="热门域名 TOP 50" data-scope="top_domains">清除重计</button></h2>
+    <div class="bars" id="topd"></div>
+    <div class="note" id="nod"></div>
+  </div>
+  <div class="card" style="margin:0">
+    <h2>被拦截域名 TOP 50 <span class="sub" id="topb-cnt"></span>
+      <button class="btn" id="clr-blk" data-src="被拦截域名 TOP 50" data-scope="top_blocked">清除重计</button></h2>
+    <div class="bars" id="topb"></div>
+    <div class="note" id="nob"></div>
+  </div>
+</div>
+
+<!-- ========== 设备（真实客户端 IP / MAC） ========== -->
+<div class="card">
+  <h2>局域网设备 <span class="tag" id="dev-tag">来自路由器邻居表 · AdGuard Home 日志</span></h2>
+  <div class="sub" style="margin-bottom:10px">
+    MosDNS 那一层看到的客户端恒为 <code>127.0.0.1</code>（dnsmasq 转发改写源地址），
+    所以这里的数据取自路由器上 <b>AdGuard Home</b> 的查询日志
+    （链路：设备 → AGH:5553 → MosDNS:127.0.0.1:5335），MAC 来自路由器邻居表。
+  </div>
+  <div class="dtwrap" id="dtwrap">
+    <table id="dt">
+      <thead><tr>
+        <th class="dsrt" data-k="ip" style="width:150px">客户端 IP</th>
+        <th class="dsrt" data-k="mac" style="width:170px">MAC 地址</th>
+        <th class="dsrt" data-k="name">设备名</th>
+        <th class="dsrt" data-k="c" style="width:90px">查询量</th>
+        <th class="dsrt" data-k="b" style="width:90px">被拦截</th>
+        <th style="width:60px"></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="note" id="dnote"></div>
+</div>
+
+<!-- ========== 真实客户端查询日志（带 IP / MAC） ========== -->
+<div class="card">
+  <h2>客户端查询日志 <span class="tag" id="at-tag">AdGuard Home</span></h2>
+  <div class="filter">
+    <input id="af" placeholder="全局搜索：客户端 IP / MAC / 域名 / 设备名（如 192.168.1.100）" autocomplete="off">
+    <button class="btn" id="afreset" title="重置筛选：清空上面这个搜索框 + 表格内的逐列筛选 + 排序，回到显示全部记录。只影响显示，不会删除任何日志数据">重置筛选</button>
+    <button class="btn" id="afwipe" title="清除筛选：把当前搜索词（如某个 IP）已匹配的记录清掉，只显示之后新产生的 —— 方便盯新数据。不删库里的日志，点「恢复」可以放回来">清除筛选</button>
+    <button class="btn" id="afrestore" style="display:none" title="把刚才清掉的旧记录放回来">恢复</button>
+    <button class="btn" id="amore">加载更多</button>
+    <span class="sub" id="afcount"></span>
+  </div>
+  <div class="atwrap" id="atwrap">
+    <table id="at">
+      <thead>
+        <tr>
+          <th style="width:80px"  class="srt" data-k="t">时间</th>
+          <th style="width:128px" class="srt" data-k="ip">客户端 IP</th>
+          <th style="width:150px" class="srt" data-k="mac">MAC 地址</th>
+          <th class="srt" data-k="d">域名</th>
+          <th style="width:56px"  class="srt" data-k="q">类型</th>
+          <th style="width:86px"  class="srt" data-k="s">状态</th>
+          <th style="width:56px"  class="srt" data-k="b">拦截</th>
+          <th style="width:56px"  class="srt" data-k="c">缓存</th>
+          <th style="width:64px"  class="srt" data-k="e">耗时</th>
+        </tr>
+        <tr class="filters">
+          <th><input class="fin" data-f="t"   placeholder="如 02:3" title="按时间匹配，写 02:3 就是 02:30~02:39"></th>
+          <th><input class="fin" data-f="ip"  placeholder="IP" title="客户端 IP 包含匹配"></th>
+          <th><input class="fin" data-f="mac" placeholder="MAC" title="MAC 地址包含匹配"></th>
+          <th><input class="fin" data-f="d"   placeholder="域名关键字" title="域名包含匹配"></th>
+          <th><select class="fin" data-f="q" title="记录类型"></select></th>
+          <th><select class="fin" data-f="s" title="响应状态"></select></th>
+          <th><select class="fin" data-f="b" title="是否被拦截"></select></th>
+          <th><select class="fin" data-f="c" title="是否命中缓存"></select></th>
+          <th><input class="fin" data-f="e" type="number" min="0" step="0.1"
+                 placeholder="≥" title="耗时大于等于多少毫秒"></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="note" id="anote"></div>
+</div>
+
+<!-- ========== 日志 ========== -->
+<div class="card">
+  <h2>最近解析日志 <span class="tag" id="log-tag"></span></h2>
+  <div class="filter">
+    <input id="lf" placeholder="过滤域名 / 设备名 / 客户端 IP / 记录类型（如 douyin / 192.168.1.100 / AAAA）" autocomplete="off">
+    <button class="btn" id="lfreset" title="重置筛选：清空左边的过滤框，回到显示全部记录。只影响显示，不会删除任何日志数据">重置筛选</button>
+    <button class="btn" id="lfwipe" title="清除筛选：把当前过滤词（如某个 IP）已匹配的记录清掉，只显示之后新产生的 —— 方便盯新数据。不删库里的日志，点「恢复」可以放回来">清除筛选</button>
+    <button class="btn" id="lfrestore" style="display:none" title="把刚才清掉的旧记录放回来">恢复</button>
+    <button class="btn" id="more">加载更多</button>
+    <button class="btn" id="loadall">载入全部</button>
+    <span class="sub" id="lfcount"></span>
+  </div>
+  <div class="tblwrap" id="tblwrap">
+    <table id="lt">
+      <thead><tr>
+        <th class="lsrt" data-k="t">时间</th>
+        <th class="lsrt" data-k="cl">客户端</th>
+        <th class="lsrt" data-k="d">域名</th>
+        <th class="lsrt" data-k="q">类型</th>
+        <th class="lsrt" data-k="s">状态</th>
+        <th class="lsrt" data-k="u">上游</th>
+        <th class="lsrt" data-k="e">耗时</th>
+        <th class="lsrt" data-k="a">解析结果</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="note" id="clinote"></div>
+</div>
+
+<footer>
+  数据来源：<code id="f-src"></code> · MosDNS stats_collector API（仅监听 127.0.0.1:9091）<br>
+  <span id="f-tip">刷新数据：在本目录执行 <code>python sync.py</code>（或 <code>sync.py --loop 10</code> 每 10 分钟自动同步）</span>
+  <div class="fmeta">
+    <a href="https://www.997wan.com/" target="_blank" rel="noopener noreferrer">www.997wan.com</a>
+    <span class="sep">·</span>
+    <a href="https://www.997wan.com/" target="_blank" rel="noopener noreferrer">997笔记</a>
+  </div>
+</footer>
+</div>
+
+<script>
+let DATA = /*__MOSDNS_DATA__*/null;
+let MODE = DATA ? 'snapshot' : null;   // snapshot = 本地内联快照 / live = 服务端实时
+const TOP_N = 50;      // 榜单条数（与标题 TOP 50 对应）
+const BAR_ROWS = 10;   // 榜单可视行数，多出来的滚动查看
+const DEV_ROWS = 10;   // 设备表可视行数，多出来的滚动查看
+
+/* ---------- 时间范围 ----------
+   live  = 直接读路由器 MosDNS 的累计值（可被面板「清除重计」影响）
+   其它  = 读面板主机本地 SQLite 的分层时序库（不受面板清除影响，是真实历史） */
+let RANGE = 'live';
+const HIST = {};       // 各区间数据缓存
+const RANGE_LABEL = {live:'实时累计', today:'今天', '7d':'近 7 天', '30d':'近 30 天', all:'自建库以来'};
+const RANGE_GRAIN = {live:'每小时', today:'每 10 分钟', '7d':'每小时', '30d':'每天', all:'每天'};
+
+async function loadRange(r, silent){
+  if(r !== 'live'){
+    const res = await fetch('/api/history?range=' + encodeURIComponent(r));
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    HIST[r] = await res.json();
+  }
+  RANGE = r;
+  document.querySelectorAll('#rng .rb').forEach(b=>{
+    b.classList.toggle('on', b.dataset.r === r);
+  });
+  if(!silent) renderAll();          // silent=后台自动刷新：由调用方决定重绘方式
+}
+/* 后台静默刷新：只更新数据，不碰当前选中的区间按钮，也不重置滚动位置 */
+async function refreshRangeSilent(){
+  try{
+    const r = RANGE;
+    const res = await fetch('/api/history?range=' + encodeURIComponent(r),
+                            {cache:'no-store'});
+    if(!res.ok) return false;
+    HIST[r] = await res.json();
+    return true;
+  }catch(e){ return false; }
+}
+/* 时间范围栏里的 QPS 小框。口径跟着区间走，和 KPI 区的 QPS 宽卡同源（kpiStats），
+   保证两处数字永远一致；历史区间去掉绿色小圆点、标签换成「平均 QPS」。 */
+function renderQpsChip(){
+  const s = kpiStats();
+  const chip = $('#qpschip');
+  if(!chip) return;
+  const live = RANGE === 'live';
+  chip.classList.toggle('live', live);
+  $('#qps-chip-lab').textContent = live ? '当前 QPS' : '平均 QPS';
+  $('#qps-chip-val').textContent = (s.qps==null || s.qps==='') ? '-' : nf(s.qps);
+}
+/* QPS 卡下面的小字：说清这个数怎么来的，避免把瞬时值和平均值搞混。
+   卡片宽度和普通卡一样（一格），所以文字必须短，两行内说完。 */
+function paintQpsSub(){
+  const el = $('#qps-sub');
+  if(!el) return;
+  if(RANGE === 'live'){
+    el.textContent = 'MosDNS 实时值 · 每秒查询数';
+    return;
+  }
+  const h = HIST[RANGE] || {};
+  const secs = h.seconds ? Math.round(h.seconds) : 0;
+  const hr = secs / 3600;
+  el.textContent = secs
+    ? '区间均值 · 按 ' + (hr >= 24 ? (hr/24).toFixed(1) + ' 天' : hr.toFixed(1) + ' 小时') + '折算'
+    : '区间均值';
+}
+function paintRangeNote(){
+  const el = $('#rng-note');
+  if(RANGE === 'live'){
+    el.textContent = '数据来自路由器 MosDNS 自身累计，可用榜单上的「清除重计」重置';
+    return;
+  }
+  const h = HIST[RANGE] || {};
+  const n = (h.points || []).length;
+  el.textContent = '数据来自面板主机本地库（' + (h.src || '-') + '，'
+    + n + ' 个数据点' + (h.first_ts ? '，自 ' + h.first_ts + ' 起累积' : '') + '）'
+    + (n ? '' : ' · 样本还在累积中');
+}
+/* 当前区间下的趋势点 */
+function trendPoints(){
+  if(RANGE === 'live') return (DATA.history || []).slice(-24);
+  return ((HIST[RANGE] || {}).points) || [];
+}
+/* 当前区间下的榜单数据 */
+function topItems(which){         // which: 'domains' | 'blocked'
+  if(RANGE === 'live') return DATA['top_' + which] || [];
+  return ((HIST[RANGE] || {})['top_' + which]) || [];
+}
+const $ = s => document.querySelector(s);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nf = n => (n==null?'-':Number(n).toLocaleString('zh-CN'));
+
+/* ---------- 会话：401 一律回登录页；登出清 cookie ---------- */
+(function(){
+  const raw = window.fetch;
+  window.fetch = function(){
+    return raw.apply(this, arguments).then(r=>{
+      if(r && r.status === 401) location.href = '/login.html';
+      return r;
+    });
+  };
+})();
+$('#logout').onclick = () => { location.href = '/api/logout'; };
+
+/* 时间范围栏的 QPS 小框：点一下复制数值（和页面上其它数字的交互一致）。
+   复制的内容带上标签，粘到聊天里也能看懂是什么数：如「当前 QPS 3」。 */
+$('#qpschip').onclick = () => {
+  const lab = $('#qps-chip-lab').textContent, v = $('#qps-chip-val').textContent;
+  copyText(v === '-' ? lab : lab + ' ' + v);
+};
+
+/* ---------- 主题 ---------- */
+$('#theme').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  document.documentElement.setAttribute('data-theme', cur==='light'?'dark':'light');
+  renderAll();
+};
+
+/* ---------- 概览 KPI ----------
+   KPI 必须跟着时间范围走：选「今天」就显示今天的总查询数/命中率，
+   选「近7天」就显示这 7 天的。实时视图读路由器的累计值，历史区间读
+   /api/history 返回的 sum（服务端已按区间聚合好，键名与 stats 一致）。
+   缓存记录数属于"此刻的状态"，任何区间都显示当前值；本地 hosts 历史库没存，显示 -。*/
+function kpiStats(){
+  if(RANGE === 'live') return DATA.stats || {};
+  return ((HIST[RANGE] || {}).sum) || {};
+}
+function renderKpis(){
+  const s = kpiStats();
+  const cs = DATA.cache_size;
+  const isRange = RANGE !== 'live';
+  /* ---------- 8 个槽位（2026-10-03 按用户要求重排，后又补了一次对调）----------
+     第一次轮换：原 8→6、原 6→3、原 3→4、原 4→8（7 号位不动）。
+     第二次（仅历史区间）：第 6、7 格对调 —— 实时视图**不动**，用户明确要求保持。
+     最终排布：
+       实时：① 总查询数 ② 缓存命中率 ③ 缓存记录数 ④ 拦截查询
+             ⑤ 平均延迟 ⑥ 当前 QPS   ⑦ 本地 hosts ⑧ 拦截占比
+       历史：① 总查询数 ② 缓存命中率 ③ 缓存记录数 ④ 拦截查询
+             ⑤ 平均延迟 ⑥ 当前 QPS   ⑦ 平均 QPS   ⑧ 拦截占比
+     ⚠️ QPS 卡比普通卡多一行 .qsub + 一个呼吸点，**结构不同**，
+        所以统一用占位对象 {qps:true} / {cur:true}，渲染时按类型分支，
+        不能再沿用「items 数组 + 末尾拼一张卡」的老写法（拼法注定了卡只能在最后）。
+     ⚠️ 第 6、7 格在两种视图下**存的卡类型正好互换**，改这里务必两个分支一起看。 */
+  const items = [
+    ['总查询数', nf(s.total_queries), '', 'b'],
+    ['缓存命中率', (s.cached_percentage??0).toFixed(2), '%', 'g'],
+    ['缓存记录数', cs==null?'-':nf(cs), '', 'p'],
+    ['拦截查询', nf(s.blocked_queries), '', 'o'],
+    ['平均延迟', (s.avg_latency_ms??0).toFixed(2), 'ms', 'g'],
+    /* 第 6 格：实时 = QPS 卡（当前 QPS，瞬时值）；
+       历史区间 = 当前 QPS 卡（也是瞬时值，与区间无关的对照组）。
+       两者都带呼吸点、绿色，只是实时那张由 qpsCard 渲染、历史这张由 curCard 渲染。 */
+    isRange ? {cur:true} : {qps:true},
+    /* 第 7 格：历史区间原来是「本地 hosts」，但它只存在于 MosDNS 的实时累计里，
+       历史库没存（服务端给的是 null），在四个历史区间下恒显示「-」，白占一格
+       → 换成 QPS 卡（此时是「平均 QPS」，区间均值）。
+       实时视图仍显示「本地 hosts」。 */
+    isRange ? {qps:true} : ['本地 hosts', (s.hosts_queries==null?'-':nf(s.hosts_queries)), '', 'p'],
+    ['拦截占比', (s.blocked_percentage??0).toFixed(2), '%', 'o'],
+  ];
+  /* QPS 卡：实时显示「当前 QPS」，历史区间显示「平均 QPS」。
+     不塞进每张卡会造成同一数字重复 7 次，所以单独成卡。
+     实时时它落在第 6 格，历史区间则落在第 7 格（见上方 items 的对调说明）。 */
+  const qpsVal = (s.qps==null || s.qps==='') ? '-' : nf(s.qps);
+  const qpsLab = isRange ? '平均 QPS' : '当前 QPS';
+  const qpsCard = `<div class="kpi qpscard${isRange?'':' live'}">` +
+    `<div class="lab">${qpsLab}` +
+      `<span class="qdot"></span></div>` +
+    `<div class="val">${qpsVal}<small>/s</small></div>` +
+    `<div class="qsub" id="qps-sub"></div></div>`;
+  /* 当前 QPS 卡（瞬时值）：历史区间落在第 6 格，与第 7 格的「平均 QPS」形成对照。
+     取 DATA.stats.qps 而不是 kpiStats() —— 后者在历史区间返回的是区间均值，
+     这里要的是「此刻」的数，跟选哪个区间无关。 */
+  const cur = (DATA.stats && DATA.stats.qps!=null && DATA.stats.qps!=='') ? DATA.stats.qps : null;
+  const curCard = `<div class="kpi qpscard live">` +
+    `<div class="lab">当前 QPS<span class="qdot"></span></div>` +
+    `<div class="val">${cur==null?'-':nf(cur)}<small>/s</small></div>` +
+    `<div class="qsub">此刻瞬时值 · 不随区间变化</div></div>`;
+  $('#kpis').innerHTML = items.map(it=>{
+    if(Array.isArray(it)){
+      const [l,v,u,c] = it;
+      return `<div class="kpi ${c}"><div class="lab">${l}</div>` +
+        `<div class="val">${v}${u?`<small>${u}</small>`:''}</div></div>`;
+    }
+    return it.qps ? qpsCard : curCard;
+  }).join('');
+  /* 给 #kpis 打上区间标记（历史排布曾用它区分，现保留备用）。 */
+  $('#kpis').classList.toggle('is-live', !isRange);
+  paintQpsSub();
+  $('#kpi-tag').textContent = RANGE_LABEL[RANGE] + '统计';
+  $('#h-host').textContent = '· ' + (DATA.host||'');
+  const when = MODE==='live' ? '实时 · ' + (DATA.synced_at||'-')
+                             : '快照 · ' + (DATA.synced_at||'-');
+  $('#h-sync').textContent = when +
+    (DATA.errors && DATA.errors.length ? ' · 部分接口异常' : '');
+  $('#dot').style.background = (DATA.errors&&DATA.errors.length) ? 'var(--orange)' : 'var(--green)';
+  $('#f-src').textContent = 'MosDNS';
+}
+
+/* ---------- 24h 趋势（原生 SVG） ---------- */
+function renderTrend(){
+  const p = trendPoints();
+  $('#trend-tag').textContent = (RANGE_GRAIN[RANGE] || '') + ' · ' + RANGE_LABEL[RANGE];
+  if(!p.length){
+    $('#trend').innerHTML = RANGE === 'live'
+      ? '<div class="sub">暂无历史数据</div>'
+      : '<div class="sub">本区间还没有采样数据 —— 服务端每分钟写一条，'
+        + '小时级数据要等下一个整点才会汇总，请稍后再看。</div>';
+    return;
+  }
+  /* 移动端适配：viewBox 宽度直接取容器实际宽度，做 1:1 渲染。
+     原来写死 860×250 + height:auto，窄屏下会等比压扁 —— 390px 手机上整张图
+     只剩 92px 高，完全看不清；且 1:1 后字号/线宽就是真实像素，不用再按缩放比补偿。 */
+  const host = $('#trend');
+  const bw = (host && host.clientWidth) || 860;
+  const narrow = bw < 560;
+  const W = Math.max(300, Math.round(bw));
+  const H = narrow ? 200 : 250;
+  const PL = narrow ? 40 : 52, PR = narrow ? 10 : 14, PT = 16, PB = narrow ? 24 : 30;
+  const xlStep = narrow ? Math.max(3, Math.ceil(p.length / 5)) : 3;
+  const iw=W-PL-PR, ih=H-PT-PB;
+  const max = Math.max(...p.map(x=>x.total||0), 10);
+  const step = Math.pow(10, Math.floor(Math.log10(max)));
+  const top = Math.ceil(max/step)*step;
+  const X = i => PL + (p.length===1?iw/2:iw*i/(p.length-1));
+  const Y = v => PT + ih - ih*(v/top);
+  let g='';
+  for(let i=0;i<=4;i++){
+    const v=top*i/4, y=Y(v);
+    g += `<line x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}" stroke="var(--border)" stroke-width="1"/>`;
+    g += `<text x="${PL-8}" y="${y+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v>=1000?(v/1000).toFixed(v>=10000?0:1)+'k':v}</text>`;
+  }
+  const pts = p.map((x,i)=>[X(i), Y(x.total||0)]);
+  const cpts = p.map((x,i)=>[X(i), Y(x.cached||0)]);
+  const line = a => a.map((q,i)=>(i?'L':'M')+q[0].toFixed(1)+' '+q[1].toFixed(1)).join(' ');
+  const area = line(pts)+` L ${X(p.length-1).toFixed(1)} ${PT+ih} L ${X(0).toFixed(1)} ${PT+ih} Z`;
+  let dots='';
+  p.forEach((x,i)=>{ if((x.blocked||0)>0)
+    dots += `<circle cx="${X(i).toFixed(1)}" cy="${Y(x.blocked||0).toFixed(1)}" r="3" fill="var(--red)"><title>${x.blocked} 拦截</title></circle>`;
+  });
+  let xl='';
+  p.forEach((x,i)=>{
+    if(i%xlStep===0 || i===p.length-1){
+      const t=(x.time||'').slice(11,16);
+      xl += `<text x="${X(i).toFixed(1)}" y="${H-10}" text-anchor="middle" font-size="10.5" fill="var(--muted)">${t}</text>`;
+    }
+  });
+  // 悬停热区：每个小时一列透明矩形，鼠标进到哪一列就显示哪一小时的数字
+  const colw = p.length > 1 ? iw/(p.length-1) : iw;
+  let hov = '';
+  p.forEach((x,i)=>{
+    hov += `<rect class="hov" data-i="${i}" x="${(X(i)-colw/2).toFixed(1)}" y="${PT}" ` +
+           `width="${colw.toFixed(1)}" height="${ih}" fill="transparent"/>`;
+  });
+  $('#trend').innerHTML = `<div class="tbox"><svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="ga" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity=".28"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+    </linearGradient></defs>
+    ${g}
+    <path d="${area}" fill="url(#ga)"/>
+    <path d="${line(cpts)}" fill="none" stroke="var(--cyan)" stroke-width="1.8" stroke-dasharray="4 3"/>
+    <path d="${line(pts)}" fill="none" stroke="var(--accent)" stroke-width="2.2"
+      stroke-linejoin="round" stroke-linecap="round"/>
+    ${dots}${xl}${hov}
+  </svg><div class="tip"></div></div>`;
+  bindTrendTip(p);
+}
+
+/* 趋势图悬停浮层：显示该小时的实际数字 */
+function bindTrendTip(p){
+  const box = $('#trend').querySelector('.tbox');
+  const tip = $('#trend').querySelector('.tip');
+  if(!box || !tip) return;
+  box.addEventListener('mousemove', e=>{
+    const el = (e.target && e.target.closest) ? e.target.closest('.hov') : null;
+    if(!el){ tip.style.display = 'none'; return; }
+    const i = parseInt(el.getAttribute('data-i'), 10);
+    const d = p[i];
+    if(!d){ tip.style.display = 'none'; return; }
+    const total = d.total || 0, cached = d.cached || 0, blocked = d.blocked || 0;
+    const rate = total ? (cached / total * 100).toFixed(1) : '0.0';
+    const when = (d.time || '').slice(5, 16).replace('T', ' ');
+    tip.innerHTML =
+      `<div class="tt">${esc(when)}</div>` +
+      `<div class="row"><span>总查询</span><span style="color:var(--accent)">${nf(total)}</span></div>` +
+      `<div class="row"><span>缓存命中</span><span style="color:var(--cyan)">${nf(cached)} · ${rate}%</span></div>` +
+      `<div class="row"><span>回源查询</span><span>${nf(Math.max(total - cached, 0))}</span></div>` +
+      `<div class="row"><span>拦截</span><span style="color:${blocked ? 'var(--red)' : 'var(--muted)'}">${nf(blocked)}</span></div>`;
+    const r = box.getBoundingClientRect();
+    const my = e.clientY - r.top;
+    let left = e.clientX - r.left;
+    left = Math.max(78, Math.min(r.width - 78, left));
+    tip.style.display = 'block';
+    tip.style.left = left + 'px';
+    tip.style.top = (my + (my > 110 ? -14 : 10)) + 'px';
+    tip.style.transform = my > 110 ? 'translate(-50%,-100%)' : 'translate(-50%,0)';
+  });
+  box.addEventListener('mouseleave', ()=>{ tip.style.display = 'none'; });
+}
+
+/* ---------- 点击复制 ---------- */
+let _toastT = 0;
+function toast(msg, ok){
+  const t = document.getElementById('toast');
+  if(!t) return;
+  t.textContent = msg;
+  t.className = 'on ' + (ok === false ? 'no' : 'ok');
+  clearTimeout(_toastT);
+  _toastT = setTimeout(()=>{ t.className = ''; }, 1600);
+}
+/* 局域网是 http，不是安全上下文，navigator.clipboard 在 Chrome 下不可用，
+   所以首选 execCommand('copy')，失败了再退回 Clipboard API */
+function copyText(txt){
+  txt = (txt || '').trim();
+  if(!txt){ toast('没有可复制的内容', false); return; }
+  let ok = false;
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, txt.length);
+    ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+  }catch(e){ ok = false; }
+  if(ok){ toast('已复制：' + txt); return; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt)
+      .then(()=>toast('已复制：' + txt))
+      .catch(()=>toast('复制失败，请手动选中', false));
+    return;
+  }
+  toast('复制失败，请手动选中', false);
+}
+/* 榜单：整行点一下就复制该域名（用事件委托，重渲染后依然有效） */
+['#topd', '#topb'].forEach(id=>{
+  const box = document.querySelector(id);
+  if(!box) return;
+  box.addEventListener('click', e=>{
+    const bar = e.target.closest ? e.target.closest('.bar') : null;
+    if(!bar) return;
+    const nm = bar.querySelector('.nm');
+    copyText(nm ? nm.textContent : '');
+  });
+});
+/* 日志表 / 客户端日志表 / 查询结果：带 .cp 的元素点一下复制（不含「拦截/缓存」徽章） */
+['lt', 'at', 'result'].forEach(id=>{
+  const box = document.getElementById(id);
+  if(!box) return;
+  box.addEventListener('click', e=>{
+    const cell = e.target.closest ? e.target.closest('.cp') : null;
+    if(cell) copyText(cell.textContent);
+  });
+});
+
+/* ---------- 局域网设备（真实客户端 IP / MAC） ---------- */
+let DEVS = [];           // {ip, mac, c, b, name}
+let AGH_OK = false, AGH_ERR = '';
+
+async function loadDevices(){
+  try{
+    const r = await fetch('/api/clients?t=' + Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    if(!(j && j.ok)) throw new Error((j && j.error) || '接口返回失败');
+    DEVS = j.clients || [];
+    renderDevices();
+    return true;
+  }catch(e){
+    $('#dnote').textContent = '读取失败：' + (e.message || e);
+    return false;
+  }
+}
+/* ---------- 设备表排序（与客户端日志表同一套三态：升序→降序→默认）---------- */
+let DSORT = {k:'', dir:0};          // dir 0=默认 1=升序 -1=降序
+const DSORT_LABEL = {ip:'客户端 IP', mac:'MAC 地址', name:'设备名', c:'查询量', b:'被拦截'};
+function dKey(k, x){
+  switch(k){
+    case 'ip': return ipNum(x.ip);          // 按数值比，别按字符串（否则 192.168.1.9 会排在 .10 后面）
+    case 'mac': return (x.mac || '').toLowerCase();
+    case 'name': return (x.name || x.host || '').toLowerCase();
+    case 'c': return x.c ?? 0;
+    case 'b': return x.b ?? 0;
+    default: return (x[k] || '').toString().toLowerCase();
+  }
+}
+/* 空值（如没有 MAC、没命名）恒沉底，升序降序都一样 */
+function dSortRows(rows){
+  if(!DSORT.k || !DSORT.dir) return rows.slice();
+  const k = DSORT.k, dir = DSORT.dir;
+  const empty = [], has = [];
+  for(const x of rows){
+    const v = dKey(k, x);
+    if(v === '' || v === -1 || v === null || v === undefined) empty.push(x);
+    else has.push(x);
+  }
+  has.sort((a,b)=>{
+    const u = dKey(k, a), w = dKey(k, b);
+    if(typeof u === 'number' && typeof w === 'number') return (u - w) * dir;
+    return String(u).localeCompare(String(w), 'zh') * dir;
+  });
+  return has.concat(empty);
+}
+function paintDSortHeads(){
+  document.querySelectorAll('#dt th.dsrt').forEach(th=>{
+    const on = th.dataset.k === DSORT.k && DSORT.dir !== 0;
+    th.classList.toggle('on', on);
+    let ar = th.querySelector('.ar');
+    if(!ar){ ar = document.createElement('span'); ar.className = 'ar'; th.appendChild(ar); }
+    ar.textContent = on ? (DSORT.dir > 0 ? '↑' : '↓') : '⇅';
+    th.title = on
+      ? `当前 ${DSORT.dir > 0 ? '升序' : '降序'}，点击${DSORT.dir > 0 ? '切降序' : '恢复默认'}`
+      : '点击按此列升序排列';
+  });
+}
+$('#dt').addEventListener('click', e=>{
+  const th = e.target.closest ? e.target.closest('th.dsrt') : null;
+  if(!th || !th.closest('thead')) return;
+  const k = th.dataset.k;
+  if(DSORT.k !== k){ DSORT = {k, dir:1}; }
+  else if(DSORT.dir === 1){ DSORT.dir = -1; }
+  else if(DSORT.dir === -1){ DSORT = {k:'', dir:0}; }
+  else { DSORT = {k, dir:1}; }
+  renderDevices();
+});
+
+function renderDevices(){
+  const tb = $('#dt').querySelector('tbody');
+  if(!DEVS.length){
+    tb.innerHTML = '<tr><td colspan="6" class="sub">还没有采到客户端数据 —— 服务端每分钟从 '
+      + 'AdGuard Home 拉一次查询日志，稍等片刻会自动出现。</td></tr>';
+    $('#dev-tag').textContent = AGH_OK ? 'AdGuard Home' : '未连通';
+    $('#dnote').textContent = AGH_ERR ? ('AdGuard Home：' + AGH_ERR) : '';
+    fitTable('#dtwrap', DEV_ROWS);
+    return;
+  }
+  const rows = dSortRows(DEVS);
+  const maxC = Math.max(...DEVS.map(x=>x.c||1));
+  tb.innerHTML = rows.map(x=>{
+    const pct = ((x.c||0) / maxC * 100).toFixed(1);
+    const nm = x.name || '';
+    // 备注名 + 技术主机名都给到 tooltip，方便对号入座
+    const tip = '点击设置设备名' + (x.host && x.host !== nm ? '（主机名：' + x.host + '）' : '');
+    return `<tr>
+      <td class="mono"><span class="cp" title="点击复制">${esc(x.ip||'-')}</span></td>
+      <td class="mono">${x.mac
+        ? `<span class="cp" title="点击复制">${esc(x.mac)}</span>`
+        : '<span class="cn">未知</span>'}</td>
+      <td class="dname" data-ip="${esc(x.ip||'')}" title="${esc(tip)}">${
+        nm ? esc(nm) : '<span class="cn">+ 命名</span>'}</td>
+      <td class="num"><div class="dcell">
+        <span class="dbar"><span class="dfill" style="width:${pct}%"></span></span>
+        <span class="dnum">${nf(x.c)}</span>
+      </div></td>
+      <td class="num"><div class="dcell">${x.b
+        ? '<span class="badge bad">' + nf(x.b) + '</span>'
+        : '<span class="cn">0</span>'}</div></td>
+      <td class="act"><div class="dcell act">
+        <button class="btn mini" data-ip="${esc(x.ip||'')}" title="只看这个设备">筛选</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+  const ips = DEVS.filter(x=>x.ip).length;
+  const withMac = DEVS.filter(x=>x.mac).length;
+  $('#dev-tag').textContent = ips + ' 台设备 · ' + withMac + ' 台有 MAC'
+    + (DSORT.dir ? ` · 按${DSORT_LABEL[DSORT.k]}${DSORT.dir > 0 ? '升序' : '降序'}` : '');
+  paintDSortHeads();
+  $('#dnote').textContent = 'MAC 取自路由器的邻居表（ip neigh），实时补全；'
+    + '设备离线或邻居表老化后可能显示「未知」。查询量/拦截数来自已采集的 '
+    + 'AdGuard Home 日志，不是全量历史。设备名来自爱快的 DHCP 租约表'
+    + '（优先用你在爱快打的备注，没有备注就退回 DHCP 上报的主机名，鼠标悬停可看主机名）；'
+    + '爱快里查不到的设备（比如手工设静态 IP 的）可以点「+ 命名」自己标，'
+    + '手动名优先级最高，只存在面板主机的 devices.conf 里。';
+  fitTable('#dtwrap', DEV_ROWS);
+}
+/* 设备表：① 「筛选」按钮 → 只看这台设备 ② 点设备名单元格 → 起名 */
+$('#dt').addEventListener('click', e=>{
+  const b = e.target.closest ? e.target.closest('button[data-ip]') : null;
+  if(b){
+    const ip = b.getAttribute('data-ip');
+    $('#af').value = ip;
+    // 顺手清掉逐列筛选，免得和「只看这台设备」叠加后啥也筛不出来
+    Object.keys(AFILT).forEach(k => { AFILT[k] = ''; });
+    document.querySelectorAll('#at .fin').forEach(el => { el.value = ''; });
+    A_SHOWN = 300; renderALogs();
+    $('#af').scrollIntoView({behavior:'smooth', block:'center'});
+    return;
+  }
+  const cell = e.target.closest ? e.target.closest('.dname') : null;
+  if(!cell) return;
+  const ip = cell.getAttribute('data-ip') || '';
+  if(!ip) return;
+  const old = (cell.textContent || '').trim();
+  if(old === '+ 命名') return editName(ip, '');
+  editName(ip, old === '—' ? '' : old);
+});
+/* ---------- 设备命名弹窗 ----------
+   原来这里是 `prompt()`：浏览器原生弹窗，位置和样式都改不了（也就没法居中）。
+   改成自定义弹窗 #nmodal，复用 .qmodal 那套居中；保存的后端逻辑一点没动。 */
+let NM_IP = '';
+function editName(ip, cur){ openNameModal(ip, cur); }
+function openNameModal(ip, cur){
+  NM_IP = ip || '';
+  $('#nm-ip').textContent = ip || '-';
+  $('#nm-input').value = cur || '';
+  $('#nmodal').classList.add('on');
+  document.body.style.overflow = 'hidden';
+  /* 等弹窗动画/布局稳定后再聚焦，否则 iOS 上会拿不到焦点 */
+  setTimeout(()=>{ const el = $('#nm-input'); if(el){ el.focus(); el.select(); } }, 80);
+}
+function closeNameModal(){
+  $('#nmodal').classList.remove('on');
+  document.body.style.overflow = '';
+  NM_IP = '';
+}
+async function saveDeviceName(name){
+  const ip = NM_IP;
+  closeNameModal();
+  if(!ip) return;
+  try{
+    const r = await fetch('/api/device_name', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ip, name: (name || '').trim()})
+    });
+    const j = await r.json();
+    if(!(j && j.ok)) throw new Error((j && j.error) || '保存失败');
+    toast((name || '').trim()
+      ? ('已保存：' + ip + ' = ' + (name || '').trim())
+      : ('已清除 ' + ip + ' 的名称'));
+    await loadDevices();
+    if(ALOGS.length) renderALogs();
+  }catch(e){
+    toast('保存失败：' + (e.message || e), false);
+  }
+}
+
+/* ---------- 客户端查询日志（含 IP / MAC） ---------- */
+let ALOGS = [], A_TOTAL = 0, A_SHOWN = 300;
+let ASORT = {k:'', dir:0};   // 点表头排序：dir 0=默认(不排) 1=升序 -1=降序
+const A_PULL = 1000;      // 自动刷新拉多少条
+/* 🔴 「清除筛选」的截止时刻表：{ 小写搜索词: 'YYYY-MM-DD HH:MM:SS' }，
+   该词下早于这个时刻的记录不再显示（之后新产生的照常显示）。
+   ⚠️ 必须声明在这里、不能放在 wipeAFilter 附近 —— renderALogs() 在脚本靠前的位置
+   就会被调用（内联快照初始化），const 有 TDZ，声明在后面会直接抛
+   "Cannot access 'A_CUTS' before initialization"。 */
+const A_CUTS = {};
+
+/* quiet=true 用于后台自动刷新：拉回来如果发现"最新一条没变"，就只更新计数、
+   不重建表格 —— 否则每 2 秒重建一次会把正在筛选/滚动的视图打断。
+   另外 AGH 那侧是每 INGEST_INTERVAL(15s) 才入库一批，拉太勤没意义。 */
+let ALOG_LAST = 0;
+const ALOG_MIN_GAP = 5000;    // 与服务端 INGEST_INTERVAL(5s) 对齐
+async function loadALogs(n, quiet){
+  try{
+    if(quiet){
+      const now = Date.now();
+      if(now - ALOG_LAST < ALOG_MIN_GAP) return false;   // 节流
+      ALOG_LAST = now;
+    }
+    const r = await fetch('/api/alog?n=' + (n || A_PULL), {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    if(!(j && j.ok)) throw new Error((j && j.error) || '接口返回失败');
+    const logs = j.logs || [];
+    A_TOTAL = j.total || logs.length;
+    AGH_OK = !!j.agh_ok; AGH_ERR = j.agh_err || '';
+    // 无新数据：只更新"库中共 N 条"，不重建表格
+    const newest = logs.length ? (logs[0].t || '') : '';
+    if(quiet && newest && ALOGS.length && newest === (ALOGS[0] || {}).t){
+      paintATag();
+      return false;
+    }
+    ALOGS = logs;
+    if(j.clients && j.clients.length){ DEVS = j.clients; renderDevices(); }
+    fillAFilters();          // 类型/状态下拉按新数据重建（保留已选值）
+    paintATag(); renderALogs();
+    return true;
+  }catch(e){
+    $('#anote').textContent = '读取失败：' + (e.message || e);
+    return false;
+  }
+}
+function paintATag(){
+  $('#at-tag').textContent = '载入 ' + ALOGS.length + ' 条 / 库中共 ' + A_TOTAL + ' 条';
+}
+/* 逐列筛选：{t 时间, ip, mac, d 域名, q 类型, s 状态, b 拦截, c 缓存, e 耗时≥} */
+const AFILT = {t:'', ip:'', mac:'', d:'', q:'', s:'', b:'', c:'', e:''};
+const YN = [['', '全部'], ['1', '是'], ['0', '否']];
+
+/* 「类型 / 状态 / 拦截 / 缓存」下拉的选项从已载入的数据里现算，保持当前选中值 */
+function fillAFilters(){
+  const opts = (list) => '<option value="">全部</option>'
+    + list.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+  const uniqSorted = key => [...new Set(ALOGS.map(x => (x[key] || '').trim())
+    .filter(Boolean))].sort();
+  const setSel = (f, html) => {
+    const el = document.querySelector(`#at .fin[data-f="${f}"]`);
+    if(!el) return;
+    const cur = AFILT[f];
+    el.innerHTML = html;
+    el.value = cur;
+    if(el.value !== cur) AFILT[f] = '';      // 选项没了就自动放弃这条筛选
+  };
+  setSel('q', opts(uniqSorted('q')));
+  setSel('s', opts(uniqSorted('s')));
+  setSel('b', YN.map(([v, t]) => `<option value="${v}">${t}</option>`).join(''));
+  setSel('c', YN.map(([v, t]) => `<option value="${v}">${t}</option>`).join(''));
+}
+/* 一条记录是否通过所有列筛选（全局关键字在外面单独判） */
+function aMatchCol(x){
+  const f = AFILT;
+  if(f.t   && !(x.t   || '').includes(f.t))                  return false;
+  if(f.ip  && !(x.ip  || '').toLowerCase().includes(f.ip))   return false;
+  if(f.mac && !(x.mac || '').toLowerCase().includes(f.mac))  return false;
+  if(f.d   && !(x.d   || '').toLowerCase().includes(f.d))    return false;
+  if(f.q   && (x.q    || '') !== f.q)                        return false;
+  if(f.s   && (x.s    || '') !== f.s)                        return false;
+  if(f.b   && String(x.b ? 1 : 0) !== f.b)                   return false;
+  if(f.c   && String(x.c ? 1 : 0) !== f.c)                   return false;
+  if(f.e   && !((x.e ?? 0) >= parseFloat(f.e)))              return false;
+  return true;
+}
+function aActiveCount(){
+  return Object.keys(AFILT).filter(k => AFILT[k] !== '').length;
+}
+/* ---- 点表头排序 ----
+   每列取值规则：布尔列(拦截/缓存)按 0/1 排，耗时按数值排，
+   IP/MAC 按数值地址排（否则 11.9 会排在 11.100 后面），其余按字符串。 */
+function aKey(k, x){
+  switch(k){
+    case 'e': return x.e ?? 0;
+    case 'b': return x.b ? 1 : 0;
+    case 'c': return x.c ? 1 : 0;
+    case 'ip':  return ipNum(x.ip);
+    case 'mac': return (x.mac || '').toLowerCase();
+    case 'q': return (x.q || '').toUpperCase();
+    case 's': return (x.s || '').toUpperCase();
+    default:  return (x[k] || '').toString().toLowerCase();
+  }
+}
+function ipNum(s){
+  if(!s) return -1;
+  const p = String(s).trim().split('.');
+  if(p.length !== 4) return -1;
+  let v = 0;
+  for(const q of p){ const n = parseInt(q, 10); if(isNaN(n)) return -1; v = v * 256 + n; }
+  return v;
+}
+/* 首列有内容的行参与排序：空值(如 MAC 未知)恒沉底，正序倒序都一样 */
+function aSortRows(rows){
+  if(!ASORT.k || !ASORT.dir) return rows.slice();
+  const k = ASORT.k, dir = ASORT.dir;
+  const empty = [], has = [];
+  for(const x of rows){
+    const v = aKey(k, x);
+    if(v === '' || v === -1 || v === null || v === undefined) empty.push(x);
+    else has.push(x);
+  }
+  has.sort((a,b)=>{
+    const u = aKey(k, a), w = aKey(k, b);
+    if(typeof u === 'number' && typeof w === 'number') return (u - w) * dir;
+    return String(u).localeCompare(String(w), 'zh') * dir;
+  });
+  return has.concat(empty);
+}
+/* 表头箭头状态：on=当前排序列，箭头 ↑/↓；未参与排序的列显示淡色 ⇅ */
+function paintSortHeads(){
+  document.querySelectorAll('#at th.srt').forEach(th=>{
+    const on = th.dataset.k === ASORT.k && ASORT.dir !== 0;
+    th.classList.toggle('on', on);
+    let ar = th.querySelector('.ar');
+    if(!ar){ ar = document.createElement('span'); ar.className = 'ar'; th.appendChild(ar); }
+    ar.textContent = on ? (ASORT.dir > 0 ? '↑' : '↓') : '⇅';
+    th.title = on
+      ? `当前 ${ASORT.dir > 0 ? '升序' : '降序'}，点击${ASORT.dir > 0 ? '切降序' : '恢复默认'}`
+      : '点击按此列升序排列';
+  });
+}
+/* 筛选行跟着表头吸顶：top = 表头首行的实际高度 */
+function stickAFilters(){
+  const r1 = document.querySelector('#at thead tr:first-child');
+  const r2 = document.querySelector('#at thead tr.filters');
+  if(!r1 || !r2) return;
+  const h1 = r1.getBoundingClientRect().height;
+  r2.querySelectorAll('th').forEach(th => { th.style.top = h1 + 'px'; });
+}
+function renderALogs(){
+  const kw = ($('#af').value||'').trim().toLowerCase();
+  const cut = A_CUTS[kw] || '';   // 「清除筛选」留下的截止时刻
+  const rows = ALOGS.filter(x=>{
+    if(cut && normTs(x.t) <= cut) return false;   // 早于截止点的不再显示
+    if(!aKwMatch(x, kw)) return false;
+    return aMatchCol(x);
+  });
+  const slice = aSortRows(rows).slice(0, A_SHOWN);
+  const na = aActiveCount();
+  $('#afcount').textContent = `渲染 ${slice.length} / 匹配 ${rows.length} 条`
+    + (rows.length < ALOGS.length ? `（库中共 ${A_TOTAL} 条）` : '')
+    + (na ? ` · 已启用 ${na} 列筛选` : '')
+    + (cut ? ` · 已清空 ${cut.slice(11)} 前的旧记录，等待新数据` : '')
+    + (ASORT.dir ? ` · 按${({t:'时间',ip:'客户端 IP',mac:'MAC',d:'域名',q:'类型',s:'状态',b:'拦截',c:'缓存',e:'耗时'})[ASORT.k]}${ASORT.dir > 0 ? '升序' : '降序'}` : '');
+  $('#amore').style.display = slice.length < rows.length ? '' : 'none';
+  const rb = $('#afrestore');
+  if(rb) rb.style.display = cut ? '' : 'none';
+  $('#at').querySelector('tbody').innerHTML = slice.map(x=>{
+    const bl = x.b ? '<span class="badge bad">是</span>' : '<span class="cn">否</span>';
+    const ca = x.c ? '<span class="badge ok">是</span>' : '<span class="cn">否</span>';
+    return `<tr>
+      <td class="time">${esc((x.t||'').slice(11,19))}</td>
+      <td class="mono"><span class="cp" title="点击复制">${esc(x.ip||'-')}</span></td>
+      <td class="mono">${x.mac
+        ? `<span class="cp" title="点击复制">${esc(x.mac)}</span>`
+        : '<span class="cn">未知</span>'}</td>
+      <td class="d"><span class="cp" title="点击复制">${esc(x.d)}</span></td>
+      <td>${esc(x.q)}</td>
+      <td>${esc(x.s||'-')}</td>
+      <td>${bl}</td>
+      <td>${ca}</td>
+      <td class="mono ${(x.e ?? 0) > 60 ? 'mshi' : 'mslo'}">${(x.e??0).toFixed(1)}ms</td>
+    </tr>`;
+  }).join('') || (cut
+    ? '<tr><td colspan="9" class="sub">已清空旧记录，正在等待新数据 —— 这个 IP 有新查询进来会自动出现在这里</td></tr>'
+    : '<tr><td colspan="9" class="sub">无匹配记录 —— 试试放宽上面的筛选条件</td></tr>');
+  stickAFilters();
+  paintSortHeads();
+}
+/* 点表头排序：升序 → 降序 → 恢复默认（事件委托挂在 #at 上，
+   只认第一行 thead 里的 th.srt，筛选行是 input/select，不受影响） */
+$('#at').addEventListener('click', e=>{
+  const th = e.target.closest ? e.target.closest('th.srt') : null;
+  if(!th || !th.closest('thead') || th.closest('tr.filters')) return;
+  const k = th.dataset.k;
+  if(ASORT.k !== k){ ASORT = {k, dir:1}; }
+  else if(ASORT.dir === 1){ ASORT.dir = -1; }
+  else if(ASORT.dir === -1){ ASORT = {k:'', dir:0}; }
+  else { ASORT = {k, dir:1}; }
+  A_SHOWN = 300; renderALogs();
+});
+/* 逐列筛选控件：输入即筛（用事件委托，重渲染后依然有效） */
+$('#at').addEventListener('input', e=>{
+  const el = e.target.closest ? e.target.closest('.fin') : null;
+  if(!el) return;
+  AFILT[el.dataset.f] = el.value.trim();
+  A_SHOWN = 300; renderALogs();
+});
+$('#at').addEventListener('change', e=>{
+  const el = e.target.closest ? e.target.closest('.fin') : null;
+  if(!el || el.tagName !== 'SELECT') return;
+  AFILT[el.dataset.f] = el.value.trim();
+  A_SHOWN = 300; renderALogs();
+});
+$('#af').oninput = ()=>{ A_SHOWN = 300; renderALogs(); };
+
+/* ==================================================================
+   两个不同的按钮，别再搞混：
+     【重置筛选】= 清空筛选*条件*，回到显示全部记录
+     【清除筛选】= 按当前搜索词（如某个 IP）把已匹配的*记录*清掉，
+                   只显示之后新产生的 —— 用来盯这个 IP 的新增查询
+   ------------------------------------------------------------------
+   🔴 为什么「清除筛选」用时间戳截止点（A_CUTS）而不是直接 splice 掉 ALOGS：
+   ALOGS 每 5 秒会被 /api/alog 整体替换一次，内存里删掉的下一次刷新就全回来了。
+   按"截止时刻"过滤才能跨刷新稳定生效，而且随时可以「恢复」—— 不真删库里的数据。
+   ================================================================== */
+function nowStr(){
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} `
+       + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+/* 🔴 时间戳比较前必须归一化：MosDNS 日志是 ISO8601（2026-10-03T22:40:08），
+   AGH 日志是空格分隔（2026-10-03 22:40:08）。两者直接字符串比大小会在
+   第 11 个字符 'T'(0x54) vs ' '(0x20) 上分叉 —— 带 T 的恒大于带空格的，
+   结果是"旧记录一条都没被清掉"。统一成空格分隔再比。 */
+function normTs(s){ return (s || '').slice(0, 19).replace('T', ' '); }
+/* 全局搜索词的匹配（原来是内联在 renderALogs 里的，抽出来给"清除"复用） */
+function aKwMatch(x, kw){
+  if(!kw) return true;
+  return (x.ip   || '').toLowerCase().includes(kw)
+      || (x.mac  || '').toLowerCase().includes(kw)
+      || (x.d    || '').toLowerCase().includes(kw)
+      || (x.name || '').toLowerCase().includes(kw)
+      || (x.q    || '').toLowerCase().includes(kw);
+}
+/* 【重置筛选】—— 清空条件，显示全部 */
+function resetAFilter(){
+  $('#af').value = '';
+  Object.keys(AFILT).forEach(k => { AFILT[k] = ''; });
+  document.querySelectorAll('#at .fin').forEach(el => { el.value = ''; });
+  ASORT = {k:'', dir:0};          // 顺带清掉排序，回到默认顺序
+  A_SHOWN = 300; renderALogs();
+  toast('已重置筛选条件，显示全部记录');
+}
+/* 【清除筛选】—— 把当前搜索词已匹配的记录清掉，只看之后新产生的 */
+function wipeAFilter(){
+  const kw = ($('#af').value || '').trim().toLowerCase();
+  if(!kw){
+    toast('先在搜索框里填条件（如 192.168.1.100），再点「清除筛选」', false);
+    return;
+  }
+  const cut = nowStr();
+  const n = ALOGS.filter(x => normTs(x.t) <= cut && aKwMatch(x, kw) && aMatchCol(x)).length;
+  A_CUTS[kw] = cut;
+  A_SHOWN = 300; renderALogs();
+  toast(`已清空「${kw}」的 ${n} 条旧记录，等 ${cut.slice(11)} 之后的新数据`);
+}
+/* 把刚才清掉的旧记录放回来 */
+function restoreAFilter(){
+  const kw = ($('#af').value || '').trim().toLowerCase();
+  if(A_CUTS[kw]) delete A_CUTS[kw];
+  A_SHOWN = 300; renderALogs();
+  toast('已恢复旧记录');
+}
+$('#af').addEventListener('keydown', e=>{
+  if(e.key === 'Escape'){ e.preventDefault(); resetAFilter(); }
+});
+$('#amore').onclick = ()=>{ A_SHOWN += 500; renderALogs(); };
+$('#atwrap').addEventListener('scroll', e=>{
+  const t = e.target;
+  if(t.scrollTop + t.clientHeight >= t.scrollHeight - 60 && A_SHOWN < ALOGS.length){
+    A_SHOWN += 500; renderALogs();
+  }
+});
+
+/* ---------- 条形榜 ---------- */
+function renderBars(el, items, color, rows){
+  if(!items || !items.length){ $(el).innerHTML = '<div class="sub">暂无数据</div>'; return; }
+  const max = Math.max(...items.map(x=>x.c||x.count||1));
+  $(el).innerHTML = items.map((x,i)=>{
+    const nm = x.d || x.domain || x.ip || '';
+    const c = x.c || x.count || 0;
+    return `<div class="bar"><span class="rank">${i+1}</span>
+      <span class="nm" title="${esc(nm)}">${esc(nm)}</span>
+      <span class="track"><span class="fill" style="width:${(c/max*100).toFixed(1)}%;background:${color}"></span></span>
+      <span class="cnt">${nf(c)}</span></div>`;
+  }).join('');
+  fitBars(el, rows || 10);
+}
+/* 表格容器高度 = 表头 + N 行的实际高度，多出来的滚动查看 */
+function fitTable(wrapSel, rows){
+  const box = $(wrapSel);
+  if(!box) return;
+  // 取前 N 行的平均行高：个别行因设备名太长换行时，只量第一行会偏大
+  const trs = box.querySelectorAll('tbody tr');
+  if(!trs.length) return;
+  const take = Math.min(trs.length, rows) || 1;
+  let sum = 0;
+  for(let i = 0; i < take; i++) sum += trs[i].getBoundingClientRect().height;
+  const h = sum / take;
+  if(!h) return;
+  const th = box.querySelector('thead tr');
+  const hh = th ? th.getBoundingClientRect().height : 0;
+  box.style.maxHeight = Math.ceil(hh + h * rows + 2) + 'px';
+}
+/* 容器高度 = N 行的实际高度，多出来的滚动查看 */
+function fitBars(el, rows){
+  const box = $(el);
+  const first = box.querySelector('.bar');
+  if(!first) return;
+  const h = first.getBoundingClientRect().height;
+  if(!h) return;
+  const gap = parseFloat(getComputedStyle(box).rowGap) || 7;
+  box.style.maxHeight = Math.ceil(h * rows + gap * (rows - 1) + 2) + 'px';
+}
+
+/* ---------- 日志表 ---------- */
+let LOGS = DATA.logs || [];
+let LOG_TOTAL = DATA.log_total || LOGS.length;
+let SHOWN = 300;              // 表格分批渲染，避免一次塞 2000 行卡死
+let ALL = false;              // 是否已载入服务端累积的全量日志
+let LT_SLICE = [];            // 当前已渲染的行（过滤+截断后），供弹窗按索引取原对象
+/* 「清除筛选」的截止时刻表（最近解析日志），语义与 A_CUTS 完全一致，见那里。
+   ⚠️ 同样必须声明在 renderLogs() 首次调用之前（const 有 TDZ）。 */
+const L_CUTS = {};
+
+/* MosDNS 日志里的客户端常是 IPv4-mapped IPv6（::ffff:192.168.1.100），
+   去掉前缀更好读，也能和 DEVS 里的纯 IPv4 对上号。 */
+function normIp(ip){
+  ip = (ip || '').trim();
+  const m = ip.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  return m ? m[1] : ip;
+}
+/* 客户端显示名：有设备名/主机名就写成「名字 (IP)」，没有就只显示 IP。
+   数据来自「局域网设备」那份 DEVS（AdGuard Home 备注名 + 邻居表主机名），
+   拉不到时退化成裸 IP，不影响功能。 */
+function clientLabel(ip){
+  return clientInfo(ip).label;
+}
+/* 把「裸 IP」拆成 {name, ip, label}：表格单元格要分两行显示（名字一行、IP 一行），
+   所以要能单独拿到 name；只想要一行文本的地方继续用 label / clientLabel()。 */
+function clientInfo(ip){
+  const v = normIp(ip);
+  if(!v) return { name:'', ip:'-', label:'-' };
+  const d = DEVS.find(x => normIp(x.ip) === v);
+  const nm = (d && (d.name || d.host)) || '';
+  return { name: nm, ip: v, label: nm ? (nm + ' (' + v + ')') : v };
+}
+/* 「最近解析日志」的客户端专用取数：
+   MosDNS 那层的 client 恒为 127.0.0.1（路由器的 dnsmasq 转发把源地址改写了），
+   服务端用 (时间秒, 域名, qtype) 和 AdGuard Home 的日志做了关联反查，结果放在 ip2。
+   有 ip2 就显示真实设备；没有（AGH 还没同步到 / 该条匹配不上）退回原始值，
+   并标上「未识别」提示，不冒充真实设备。 */
+function logClient(x){
+  const real = (x && x.ip2 && x.ip2.length) ? x.ip2 : null;
+  if(real){
+    return Object.assign(clientInfo(real[0]), { n: real.length, real: true });
+  }
+  return Object.assign(clientInfo((x||{}).ip), { n: 0, real: false });
+}
+
+/* ---------- 状态码 / 上游 显示名 → 中文 ----------
+   实测库里 status 只有两种：NOERROR(99.8%)、NXDOMAIN(0.2%)；
+   其余是 DNS 标准 RCODE，先把常见几个备着，认不出的原样显示（不硬翻、不编造）。 */
+const ST_CN = {
+  NOERROR:'成功', NXDOMAIN:'域名不存在', SERVFAIL:'服务器失败',
+  REFUSED:'拒绝应答', NOTIMP:'未实现', FORMERR:'格式错误',
+  NODATA:'无数据', BADVERS:'版本不支持',
+};
+function stCn(s){
+  const v = (s||'').trim();
+  return ST_CN[v.toUpperCase()] || v || '-';
+}
+/* 上游：命中缓存时 MosDNS 记的就是字面量 'cache'（占 91.9%）→ 「缓存」。
+   其它取值是真实上游（DoH 地址 / IP），那是定位解析问题要用的信息，保持原样。 */
+function upCn(u){
+  const v = (u||'').trim();
+  if(!v) return '-';
+  return v === 'cache' ? '缓存' : v;
+}
+function paintLogTag(){
+  $('#log-tag').textContent = '载入 ' + LOGS.length + ' 条 / 库中共 ' + LOG_TOTAL + ' 条';
+}
+
+/* ---------- 日志表排序（与设备表同一套三态：升序 → 降序 → 恢复默认）----------
+   每一列都能点。取值规则按列不同，不能一律按字符串比：
+     t(时间) —— 'YYYY-MM-DD HH:MM:SS' 定长可比字符串，但表里只显示 HH:MM:SS，
+                必须用完整时间戳排，否则跨天会乱序（23:59 和 00:01 会挨在一起）。
+     cl(客户端)—— 屏幕显示的是「关联反查出的真实设备」，所以按 logClient(x) 的
+                设备名排；同名再按 IP 数值排（字符串比会让 .9 排在 .10 后面）。
+     e(耗时) —— 数值，不能字符串比（'9.00' > '10.00' 会排错）。
+     a(解析结果)—— 按应答条数排（x.n），条数相同再按第一条 IP。
+   空值恒沉底：升序降序都一样。 */
+let LSORT = {k:'', dir:0};          // dir 0=默认 1=升序 -1=降序
+const LSORT_LABEL = {t:'时间', cl:'客户端', d:'域名', q:'类型', s:'状态', u:'上游',
+                     e:'耗时', a:'解析结果'};
+function lKey(k, x){
+  switch(k){
+    case 't': return (x.t || '').replace('T', ' ');
+    case 'cl': {
+      const c = logClient(x);
+      const nm = (c.name || '').trim();          // 设备名优先
+      if(nm) return nm.toLowerCase();
+      const ip = (c.ip || '').trim();            // 没名字就退回 IP
+      return (ip && ip !== '-') ? ip : '';
+    }
+    case 'd': return (x.d || '').toLowerCase();
+    case 'q': return (x.q || '').toLowerCase();
+    /* 状态/上游：按界面显示的中文排才对得上下。
+       空值在界面上显示成 '-'，但它代表「没有」，
+       必须返回 '' 让 lSortRows 把它归到空值桶沉底 —— 否则 '-' 会被当成
+       一个普通字符参与排序，混在列表中间，看起来像有内容。 */
+    case 's': return (x.s || '').trim() ? stCn(x.s) : '';
+    case 'u': return (x.u || '').trim() ? upCn(x.u) : '';
+    case 'e': return x.e ?? -1;
+    case 'a': return (x.n ?? (x.a || []).length);
+    default: return (x[k] || '').toString().toLowerCase();
+  }
+}
+/* 次级排序键：同一列值相同时的稳定次序，避免行序随机跳动。
+   客户端同名按 IP 数值升序（与 dir 无关，只用于打破平局）。 */
+function lKey2(k, x){
+  if(k === 'cl'){
+    const c = logClient(x);
+    return ipNum(c.ip);
+  }
+  if(k === 'a'){
+    const v = ((x.a || [])[0] || {}).v || '';
+    return v.toLowerCase();
+  }
+  return '';
+}
+function lSortRows(rows){
+  if(!LSORT.k || !LSORT.dir) return rows.slice();
+  const k = LSORT.k, dir = LSORT.dir;
+  const empty = [], has = [];
+  for(const x of rows){
+    const v = lKey(k, x);
+    if(v === '' || v === -1 || v === null || v === undefined) empty.push(x);
+    else has.push(x);
+  }
+  has.sort((a,b)=>{
+    const u = lKey(k, a), w = lKey(k, b);
+    let c;
+    if(typeof u === 'number' && typeof w === 'number') c = (u - w) * dir;
+    else c = String(u).localeCompare(String(w), 'zh') * dir;
+    if(c) return c;
+    /* 平局：客户端按 IP 数值、解析结果按首条 IP，其余列保持稳定（返回 0） */
+    const u2 = lKey2(k, a), w2 = lKey2(k, b);
+    if(typeof u2 === 'number' && typeof w2 === 'number') return (u2 - w2) * dir;
+    if(u2 || w2) return String(u2).localeCompare(String(w2), 'zh') * dir;
+    return 0;
+  });
+  return has.concat(empty);
+}
+function paintLSortHeads(){
+  document.querySelectorAll('#lt th.lsrt').forEach(th=>{
+    const on = th.dataset.k === LSORT.k && LSORT.dir !== 0;
+    th.classList.toggle('on', on);
+    let ar = th.querySelector('.ar');
+    if(!ar){ ar = document.createElement('span'); ar.className = 'ar'; th.appendChild(ar); }
+    ar.textContent = on ? (LSORT.dir > 0 ? '↑' : '↓') : '⇅';
+    th.title = on
+      ? `当前 ${LSORT.dir > 0 ? '升序' : '降序'}，点击${LSORT.dir > 0 ? '切降序' : '恢复默认'}`
+      : '点击按此列升序排列';
+  });
+}
+/* 点表头切排序。绑定在 #lt 上用事件委托（表头不会被重渲染掉，
+   但 tbody 会整块重写，绑在 th 上每次都要重绑）。 */
+$('#lt').addEventListener('click', e=>{
+  const th = e.target.closest ? e.target.closest('th.lsrt') : null;
+  if(!th) return;                               // tbody 的行点击另有分支处理
+  const k = th.dataset.k;
+  if(LSORT.k !== k){ LSORT = {k, dir:1}; }
+  else if(LSORT.dir === 1){ LSORT.dir = -1; }
+  else if(LSORT.dir === -1){ LSORT = {k:'', dir:0}; }
+  else { LSORT = {k, dir:1}; }
+  renderLogs();
+});
+
+/* 全局搜索词的匹配（从 renderLogs 里抽出来，给「清除筛选」复用。
+   客户端一栏显示的是「关联反查出来的真实设备」，所以过滤必须按 ip2 里的
+   真实 IP / 设备名来匹配 —— 否则用户照着屏幕上显示的 192.168.1.100 去搜，
+   会一条都搜不到（x.ip 恒为 127.0.0.1）。）*/
+function lKwMatch(x, kw){
+  if(!kw) return true;
+  const cl = logClient(x);
+  return (x.d||'').toLowerCase().includes(kw)
+    || (x.q||'').toLowerCase().includes(kw)
+    || (cl.label||'').toLowerCase().includes(kw)
+    || (x.ip||'').toLowerCase().includes(kw)
+    || (x.u||'').toLowerCase().includes(kw)
+    /* 状态和 upstream 在界面上显示的是中文，过滤就得能按中文搜，
+       否则搜「缓存」「成功」一条都搜不到（同 ip2 那个坑）。 */
+    || (upCn(x.u)||'').toLowerCase().includes(kw)
+    || (stCn(x.s)||'').toLowerCase().includes(kw)
+    || (x.a||[]).some(a=>(a.v||'').toLowerCase().includes(kw));
+}
+function renderLogs(){
+  const kw = ($('#lf').value||'').trim().toLowerCase();
+  const cut = L_CUTS[kw] || '';   // 「清除筛选」留下的截止时刻
+  const rows = LOGS.filter(x=>{
+    if(cut && normTs(x.t) <= cut) return false;   // 早于截止点的不再显示
+    return lKwMatch(x, kw);
+  });
+  const slice = lSortRows(rows).slice(0, SHOWN);
+  $('#lfcount').textContent = `渲染 ${slice.length} / 匹配 ${rows.length} 条`
+    + (rows.length < LOGS.length ? `（库中共 ${LOG_TOTAL} 条）` : '')
+    + (cut ? ` · 已清空 ${cut.slice(11)} 前的旧记录，等待新数据` : '')
+    + (LSORT.dir ? ` · 按${LSORT_LABEL[LSORT.k]}${LSORT.dir > 0 ? '升序' : '降序'}` : '');
+  $('#more').style.display = slice.length < rows.length ? '' : 'none';
+  const rb = $('#lfrestore');
+  if(rb) rb.style.display = cut ? '' : 'none';
+  LT_SLICE = slice;                    // 供「点行看详情」取原始对象
+  $('#lt').querySelector('tbody').innerHTML = slice.map((x,i)=>{
+    /* 单元格最多 2 行（CSS line-clamp），省略的部分靠 title 和弹窗补全。 */
+    const ansTxt = (x.a||[]).map(a=>`${a.t} ${a.v}`).join('  /  ') || '（无记录）';
+    const ans = (x.a||[]).map(a=>`<span class="t">${esc(a.t)}</span> <span class="v">${esc(a.v)}</span>`).join('<br>')
+      || '<span class="cn">（无记录）</span>';
+    const badge = x.b ? '<span class="badge bad">拦截</span> '
+      : (x.c ? '<span class="badge ok">缓存</span> ' : '');
+    /* 整行可点 → 弹出详情。单元格里的 .cp 仍负责「点一下复制」，
+       所以行点击要排除 .cp（详见下方的点击处理）。 */
+    const cl = logClient(x);
+    /* 两行显示：第一行设备名（DEVS 里查不到名字时不渲染这行，直接只显示 IP），
+       第二行 IP + 标注。IP 必须完整可见 —— 用户要看的正是它。 */
+    const amb = (cl.n > 1 ? `<span class="amb" title="同一秒有 ${cl.n} 台设备查询过这个域名，无法判断是哪一台"> 等${cl.n}台</span>` : '')
+      + (cl.real ? '' : '<span class="amb off" title="AdGuard Home 尚未同步到这一条，未能关联出真实设备"> 未识别</span>');
+    const cliHtml = (cl.name ? `<span class="cnm">${esc(cl.name)}</span>` : '')
+      + `<span class="cip">${esc(cl.ip)}${amb}</span>`;
+    return `<tr class="lrow" data-li="${i}" title="点击查看详情">
+      <td class="time">${esc((x.t||'').slice(11,19))}</td>
+      <td class="mono cli" title="${esc(cl.label)}">${cliHtml}</td>
+      <td class="d">${badge}<span class="cp" title="点击复制">${esc(x.d)}</span></td>
+      <td${/^(A|AAAA)$/.test((x.q||'').toUpperCase()) ? ' class="qt-a"' : ''}>${esc(x.q)}</td>
+      <td>${esc(stCn(x.s))}</td>
+      <td class="mono u" title="${esc(x.u||'-')}">${esc(upCn(x.u))}</td>
+      <td class="mono ${(x.e ?? 0) > 60 ? 'mshi' : 'mslo'}">${(x.e??0).toFixed(2)}ms</td>
+      <td class="ans" title="${esc(ansTxt)}"><div class="ansin">${ans}${x.n>(x.a||[]).length?`<br><span class="cn">… 共 ${x.n} 条</span>`:''}</div></td>
+    </tr>`;
+  }).join('') || (cut
+    ? '<tr><td colspan="8" class="sub">已清空旧记录，正在等待新数据 —— 有新查询进来会自动出现在这里</td></tr>'
+    : '<tr><td colspan="8" class="sub">无匹配记录</td></tr>');
+  paintLSortHeads();
+}
+$('#lf').oninput = ()=>{ SHOWN = 300; renderLogs(); };
+/* 与客户端查询日志完全对齐的两个按钮：【重置筛选】清条件 / 【清除筛选】清记录 */
+function resetLFilter(){
+  $('#lf').value = ''; SHOWN = 300; renderLogs();
+  toast('已重置筛选条件，显示全部记录');
+}
+function wipeLFilter(){
+  const kw = ($('#lf').value || '').trim().toLowerCase();
+  if(!kw){
+    toast('先在过滤框里填条件（如 192.168.1.100），再点「清除筛选」', false);
+    return;
+  }
+  const cut = nowStr();
+  const n = LOGS.filter(x => normTs(x.t) <= cut && lKwMatch(x, kw)).length;
+  L_CUTS[kw] = cut;
+  SHOWN = 300; renderLogs();
+  toast(`已清空「${kw}」的 ${n} 条旧记录，等 ${cut.slice(11)} 之后的新数据`);
+}
+function restoreLFilter(){
+  const kw = ($('#lf').value || '').trim().toLowerCase();
+  if(L_CUTS[kw]) delete L_CUTS[kw];
+  SHOWN = 300; renderLogs();
+  toast('已恢复旧记录');
+}
+$('#lf').addEventListener('keydown', e=>{
+  if(e.key === 'Escape'){ e.preventDefault(); resetLFilter(); }
+});
+$('#more').onclick = ()=>{ SHOWN += 400; renderLogs(); };
+
+/* ---------- 查询日志详情弹窗 ----------
+   数据全部取自该行原始对象，缺的字段显示「-」。
+   注意 MosDNS 的日志里**没有 TTL 字段**（answers 只存 {type, value}），
+   所以弹窗里不做 TTL 标签 —— 不拿别的数糊弄。 */
+let LT_CUR = null;
+function openLogModal(x){
+  if(!x) return;
+  LT_CUR = x;
+  const ts = x.t || '';
+  $('#qm-name').textContent = x.d || '-';
+  $('#qm-type').textContent = x.q || '';
+  const bd = [];
+  if(x.b)      bd.push('<span class="badge bad">已拦截</span>');
+  else if(x.c) bd.push('<span class="badge ok">CACHED</span>');
+  if(x.s)      bd.push('<span class="badge info" title="' + esc(x.s) + '">' + esc(stCn(x.s)) + '</span>');
+  $('#qm-badges').innerHTML = bd.join(' ');
+  $('#qm-ms').textContent = (x.e ?? 0).toFixed(2) + ' ms';
+  /* 客户端：优先显示服务端关联出的真实设备，并注明来源（这一列是推断出来的，
+     不是 MosDNS 直接给的 —— 那层只有 127.0.0.1）。 */
+  const cl = logClient(x);
+  $('#qm-client').innerHTML = esc(cl.label)
+    + (cl.n > 1 ? ` <span class="amb" title="同一秒有 ${cl.n} 台设备查询过这个域名">等${cl.n}台</span>` : '')
+    + (cl.real
+        ? ' <span class="src" title="MosDNS 日志里的客户端恒为 127.0.0.1（dnsmasq 转发改写源地址）。这一栏是用「时间+域名+类型」与 AdGuard Home 日志关联反查出的真实设备">由 AGH 关联</span>'
+        : ' <span class="src off" title="未能关联到真实设备：AdGuard Home 还没同步到这一条">未识别</span>');
+  $('#qm-time').textContent = ts
+    ? ts.slice(11,19) + '（' + ts.slice(0,10) + '）' : '-';
+  /* 上游：显示中文（cache → 缓存），原始值放在 title 里，
+     万一要看真实 DoH 地址还能悬停看到。 */
+  const upEl = $('#qm-up');
+  upEl.textContent = upCn(x.u);
+  upEl.title = x.u || '-';
+  $('#qm-rule').textContent = x.r || '-';
+  /* 应答：全部列出，一条不删。
+     ⚠️ 但服务端入库时按 ANS_LIMIT 截断过（原来是 3 条，实测 52% 的记录
+     应答超过 3 条、最多到 26 条）。老数据里少掉的那部分是**回溯不回来的**
+     （MosDNS 的 /logs 接口只留最近几百条，历史拿不到）。
+     所以这里如实标一行提示，别让人以为是前端偷懒截的。 */
+  const a = x.a || [];
+  const totalAns = (x.n != null ? x.n : a.length);
+  $('#qm-acnt').textContent = totalAns;
+  $('#qm-ans').innerHTML = a.length
+    ? a.map(r=>`<div class="qr"><span class="qt2">${esc(r.t)}</span>` +
+        `<span class="qv">${esc(r.v)}</span></div>`).join('')
+        + (a.length < totalAns
+            ? `<div class="qtrunc">这条记录入库时只保留了前 ${a.length} 条应答，`
+              + `实际应答 ${totalAns} 条（服务端 ANS_LIMIT 上限所致）。`
+              + `调大上限后<strong>新采集</strong>的记录才会完整，已入库的无法回溯补全。</div>`
+            : '')
+    : (totalAns > 0
+        ? `<div class="qtrunc">这条记录有 ${totalAns} 条应答，但入库时一条都没保留下来。</div>`
+        : '<div class="qempty">没有应答记录（可能被拦截 / 域名不存在 / 上游无应答）</div>');
+  $('#qmodal').classList.add('on');
+  document.body.style.overflow = 'hidden';
+}
+function closeLogModal(){
+  $('#qmodal').classList.remove('on');
+  document.body.style.overflow = '';
+  LT_CUR = null;
+}
+/* 点行打开详情。行里的 .cp（域名）仍走「点一下复制」，
+   所以命中 .cp 时直接放行，不弹窗。 */
+$('#lt').addEventListener('click', e=>{
+  if(!e.target.closest) return;
+  if(e.target.closest('.cp')) return;              // 交给复制逻辑
+  const tr = e.target.closest('tr.lrow');
+  if(!tr) return;
+  const i = parseInt(tr.dataset.li, 10);
+  if(!isNaN(i)) openLogModal(LT_SLICE[i]);
+});
+/* ⚠️ 弹窗的 DOM 写在 <script> 之后（和 #toast 一样放在 </body> 前），
+   所以这里**不能**用 $('#qm-close').onclick 直接绑 —— 执行到这一行时元素还不存在。
+   统一走 document 事件委托，顺便也把「点遮罩关闭」一起处理。 */
+/* 🔴 走委托的按钮 id 白名单 + 祖先链查找。
+   为什么不能用 e.target.id：点中按钮内部的文字/子节点时 e.target 是子节点、没有 id，
+   旧写法 `if(!t || !t.id) return;` 会把整次点击跳过 —— 表现就是"按钮点了没反应"。
+   为什么也不能用 t.closest('[id]')：它停在"最近的任意带 id 的祖先"上，
+   而浏览器划词翻译类扩展经常给包裹文字的 span 也带上 id，那样就会漏掉真正的按钮。
+   所以沿祖先链逐层查白名单，命中哪一个算哪一个。 */
+const DBTN = new Set(['qm-close', 'qm-copy', 'nm-save', 'nm-cancel', 'nm-clear',
+                      'afreset', 'afwipe', 'afrestore',
+                      'lfreset', 'lfwipe', 'lfrestore',
+                      'cm-ok', 'cm-cancel']);
+function delegBtn(node){
+  for(let n = node; n && n.nodeType === 1; n = n.parentElement){
+    if(n.id && DBTN.has(n.id)) return n.id;
+  }
+  return '';
+}
+document.addEventListener('click', e=>{
+  const t = e.target;
+  if(!t) return;
+  const bid = delegBtn(t);
+  if(bid === 'qm-close'){ closeLogModal(); return; }
+  if(bid === 'qm-copy'){ if(LT_CUR && LT_CUR.d) copyText(LT_CUR.d); return; }
+  /* 设备命名弹窗（同样在 script 之后，必须走委托） */
+  if(bid === 'nm-save'){ saveDeviceName($('#nm-input').value); return; }
+  if(bid === 'nm-cancel'){ closeNameModal(); return; }
+  if(bid === 'nm-clear'){ saveDeviceName(''); return; }   // 空名字 = 清除
+  /* 客户端查询日志：重置筛选（清条件）/ 清除筛选（清记录）/ 恢复 / 最近解析日志的清除
+     走委托，避免直接赋值 onclick 被脚本异常带崩 */
+  if(bid === 'afreset'){   resetAFilter();   return; }
+  if(bid === 'afwipe'){    wipeAFilter();    return; }
+  if(bid === 'afrestore'){ restoreAFilter(); return; }
+  if(bid === 'lfreset'){   resetLFilter();   return; }
+  if(bid === 'lfwipe'){    wipeLFilter();    return; }
+  if(bid === 'lfrestore'){ restoreLFilter(); return; }
+  /* 清除重计确认弹窗（同样在 script 之后，必须走委托） */
+  if(bid === 'cm-ok'){ closeClear(true); return; }
+  if(bid === 'cm-cancel'){ closeClear(false); return; }
+  /* ⚠️ 遮罩层必须判断「点到的就是遮罩本身」—— 用祖先链匹配会把"点弹窗正文"也算成命中，
+     那就会一点内容就把弹窗关掉。所以这三条保留严格 id 比较。 */
+  if(t.id === 'qmodal'){ closeLogModal(); return; }
+  if(t.id === 'nmodal'){ closeNameModal(); return; }
+  if(t.id === 'cmodal'){ closeClear(false); }              // 点遮罩 = 取消
+});
+document.addEventListener('keydown', e=>{
+  const m = document.getElementById('qmodal');
+  if(e.key === 'Escape' && m && m.classList.contains('on')){ closeLogModal(); return; }
+  /* 清除重计弹窗：Esc = 取消（确认按钮不绑 Enter，避免误触） */
+  const c = document.getElementById('cmodal');
+  if(e.key === 'Escape' && c && c.classList.contains('on')){ closeClear(false); return; }
+  /* 命名弹窗：Esc 取消、Enter 保存 */
+  const n = document.getElementById('nmodal');
+  if(!(n && n.classList.contains('on'))) return;
+  if(e.key === 'Escape'){ closeNameModal(); }
+  else if(e.key === 'Enter'){ saveDeviceName(document.getElementById('nm-input').value); }
+});
+$('#tblwrap').addEventListener('scroll', e=>{
+  const t = e.target;
+  if(t.scrollTop + t.clientHeight >= t.scrollHeight - 60 && SHOWN < LOGS.length){
+    SHOWN += 400; renderLogs();
+  }
+});
+// 从服务端拉日志。库里现在留 20000 条（约 13MB），一次全拉会拖慢首屏，
+// 所以自动刷新只拉前 AUTO_LOG_PULL 条，全量交给「载入全部」按钮按需触发。
+const AUTO_LOG_PULL = 3000;
+async function loadAllLogs(n){
+  const want = n || (DATA.log_keep || LOG_TOTAL || 3000);
+  try{
+    const r = await fetch('/api/logs?n=' + want, {cache:'no-store'});
+    if(!r.ok) return false;
+    const j = await r.json();
+    if(j && j.ok && j.logs && j.logs.length){ LOGS = j.logs; LOG_TOTAL = j.total; return true; }
+  }catch(e){}
+  return false;
+}
+$('#loadall').onclick = async ()=>{
+  const b = $('#loadall'); b.textContent = '载入中…'; b.disabled = true;
+  const ok = await loadAllLogs();                 // 全量（LOG_KEEP）
+  SHOWN = 300; paintLogTag(); renderLogs();
+  b.textContent = ok ? '已载入全部' : '载入失败';
+  setTimeout(()=>{ b.textContent = '载入全部'; b.disabled = false; }, 1200);
+};
+
+/* ---------- 域名/IP 查询 ---------- */
+const isIP = s => /^(\d{1,3}\.){3}\d{1,3}$/.test(s) || s.includes(':');
+
+function ccFlag(cc){
+  if(!cc || cc.length!==2) return '🌐';
+  return String.fromCodePoint(...[...cc.toUpperCase()].map(c=>0x1F1E6 + c.charCodeAt(0)-65));
+}
+
+const DOH = [
+  'https://dns.alidns.com/dns-query',
+  'https://cloudflare-dns.com/dns-query',
+  'https://dns.google/resolve'
+];
+async function dnsq(name, type){
+  for(const base of DOH){
+    try{
+      const r = await fetch(base + '?name=' + encodeURIComponent(name) + '&type=' + type,
+        {headers:{accept:'application/dns-json'}});
+      if(!r.ok) continue;
+      return await r.json();
+    }catch(e){}
+  }
+  return null;
+}
+
+async function geo(ip){
+  const list = [
+    'https://ipwho.is/' + ip,
+    'https://ipapi.co/' + ip + '/json/',
+    'http://ip-api.com/json/' + ip,
+  ];
+  for(const u of list){
+    try{
+      const r = await fetch(u, {cache:'no-store'});
+      if(!r.ok) continue;
+      const j = await r.json();
+      const cc = j.countryCode || j.country_code;
+      if(!cc) continue;
+      return {cc, country: j.country || j.country_name, city: j.city,
+        isp: j.isp || j.org || (j.connection && j.connection.org) || (j.asn && j.asn.name),
+        asn: j.as || (j.asn && ('AS' + j.asn.asn)), flag: (j.flag && j.flag.emoji) || ccFlag(cc)};
+    }catch(e){}
+  }
+  return null;
+}
+
+/* 网站图标：本地 static/logo 优先 -> 站点自身 -> Google s2 -> DuckDuckGo -> favicon.im -> 地球占位 */
+function favSrcs(d){
+  return [
+        '/static/logo/' + d + '.png',
+    '/static/logo/' + d + '.ico',
+    '/static/logo/' + d + '.jpg',
+    '/static/logo/' + d + '.svg',
+'https://' + d + '/favicon.ico',
+    'https://www.google.com/s2/favicons?domain=' + d + '&sz=128',
+    'https://icons.duckduckgo.com/ip3/' + d + '.ico',
+    'https://favicon.im/' + d
+  ];
+}
+function faviconHTML(d){
+  return `<img src="${esc(favSrcs(d)[0])}" alt="icon" data-fav="${esc(d)}" data-i="0"
+    onerror="favNext(this)">`;
+}
+window.favNext = function(img){
+  const d = img.getAttribute('data-fav');
+  let i = parseInt(img.getAttribute('data-i') || '0', 10) + 1;
+  const s = favSrcs(d);
+  if(i < s.length){ img.setAttribute('data-i', i); img.src = s[i]; return; }
+  const sp = document.createElement('span');
+  sp.style.fontSize = '26px'; sp.textContent = '🌐'; sp.title = '未能获取站点图标';
+  if(img.parentNode) img.parentNode.replaceChild(sp, img);
+};
+
+/* 在 MosDNS 本地统计里找这个域名 */
+function localHit(domain){
+  const d = domain.toLowerCase().replace(/\.$/,'');
+  const hitTop = (DATA.top_domains||[]).find(x=>(x.d||'').toLowerCase().replace(/\.$/,'')===d);
+  const hitBlk = (DATA.top_blocked||[]).find(x=>(x.d||'').toLowerCase().replace(/\.$/,'')===d);
+  const logs = (DATA.logs||[]).filter(x=>(x.d||'').toLowerCase().replace(/\.$/,'').endsWith(d)
+    || (x.d||'').toLowerCase().replace(/\.$/,'').endsWith('.'+d));
+  const ips = new Set();
+  logs.forEach(x=>(x.a||[]).forEach(a=>{ if(a.t==='A'||a.t==='AAAA') ips.add(a.v); }));
+  return {hitTop, hitBlk, logs: logs.slice(0,5), count: logs.length, ips:[...ips].slice(0,8)};
+}
+
+async function doQuery(){
+  const raw = ($('#q').value||'').trim();
+  if(!raw){ resetResult(); return; }     // 空输入 = 回到默认提示，不报错
+  const input = raw.replace(/^https?:\/\//,'').replace(/\/.*$/,'').replace(/:\d+$/,'');
+  Q_DONE = input;
+  $('#result').innerHTML = '<div class="spin">正在解析 …</div>';
+
+  const ipMode = isIP(input);
+  let ips = [], cnames = [];
+  let domain = ipMode ? null : input;
+  let srv = null;
+
+  // ① 优先走服务端：让路由器的 MosDNS 真机解析一次，拿到权威应答 + 命中规则/上游
+  if(MODE === 'live'){
+    try{
+      const r = await fetch('api/query?name=' + encodeURIComponent(input), {cache:'no-store'});
+      if(r.ok) srv = await r.json();
+    }catch(e){}
+  }
+  if(srv && srv.ok){
+    (srv.answers || []).forEach(a=>{
+      if(a.type === 'A' || a.type === 'AAAA') ips.push(a.value);
+      else if(a.type === 'CNAME') cnames.push(a.value);
+    });
+  }
+
+  if(ipMode){
+    ips = [input];
+  }else if(!ips.length && !cnames.length){
+    // ② 浏览器端 DoH 兜底
+    const [a, aaaa] = await Promise.all([dnsq(input,'A'), dnsq(input,'AAAA')]);
+    const pick = j => (j && j.Answer ? j.Answer : []);
+    pick(a).forEach(r=>{ if(r.type===5) cnames.push(r.data); if(r.type===1) ips.push(r.data); });
+    pick(aaaa).forEach(r=>{ if(r.type===28) ips.push(r.data); });
+    if(!ips.length && !cnames.length){
+      const c = await dnsq(input,'CNAME');
+      pick(c).forEach(r=>{ if(r.type===5) cnames.push(r.data); });
+    }
+  }
+
+  const g = ips.length ? await geo(ips[0]) : null;
+  const hit = domain ? localHit(domain) : {logs:[],count:0,ips:[]};
+
+  let html = '<div class="rbox"><div class="rhead">';
+  if(ipMode){
+    html += `<div class="iconwrap"><div class="flagbig">${g?g.flag:'🌐'}</div></div>`;
+  }else{
+    html += `<div class="iconwrap">${faviconHTML(input)}</div>`;
+  }
+  html += `<div>
+      <div class="rtitle"><span class="cp" title="点击复制">${esc(domain || input)}</span></div>
+      <div class="rsub">${ipMode ? 'IP 地址查询' : '域名查询'} · ${ips.length?ips.length+' 个解析 IP':'未获得解析结果'}</div>
+    </div>
+    <div class="spacer"></div>`;
+  if(g) html += `<div style="text-align:right"><div class="flagbig">${g.flag}</div>
+      <div class="rsub">${esc(g.country||g.cc)}</div></div>`;
+  html += '</div>';
+
+  html += '<div class="badges">';
+  if(srv && srv.ok && srv.handling && Object.keys(srv.handling).length){
+    Object.keys(srv.handling).sort().forEach(q=>{
+      const m = srv.handling[q];
+      html += `<span class="badge ${m.blocked?'bad':'ok'}">${esc(q)} ${esc(m.status)}</span>`;
+      if(m.upstream) html += `<span class="badge info">${esc(q)} 上游 ${esc(m.upstream)}</span>`;
+      else if(!m.blocked) html += `<span class="badge warn">${esc(q)} 无上游</span>`;
+      if(m.rule) html += `<span class="badge">${esc(q)} 规则 ${esc(m.rule)}</span>`;
+      html += `<span class="badge">${m.cached?'缓存':'回源'} ${(m.elapsed_ms??0).toFixed(1)}ms</span>`;
+      if(m.blocked) html += `<span class="badge bad">${esc(q)} 已拦截</span>`;
+    });
+    if(srv.took_ms) html += `<span class="badge">往返 ${srv.took_ms}ms</span>`;
+  }else if(srv && srv.ok && srv.mosdns){
+    const m = srv.mosdns;
+    html += `<span class="badge ${m.blocked?'bad':'ok'}">MosDNS ${esc(m.status)}</span>`;
+    if(m.upstream) html += `<span class="badge info">上游 ${esc(m.upstream)}</span>`;
+    if(m.rule) html += `<span class="badge">规则 ${esc(m.rule)}</span>`;
+  }
+  if(g) html += `<span class="badge info">${esc(g.cc)} · ${esc(g.city||'-')}</span>`;
+  if(g&&g.isp) html += `<span class="badge">${esc(g.isp)}</span>`;
+  if(g&&g.asn) html += `<span class="badge">${esc(g.asn)}</span>`;
+  if(hit.hitTop) html += `<span class="badge ok"> MosDNS 热门第 ${(DATA.top_domains.findIndex(x=>x.d===hit.hitTop.d)+1)} 名 · ${nf(hit.hitTop.c)} 次</span>`;
+  if(hit.hitBlk) html += `<span class="badge bad">被拦截 ${nf(hit.hitBlk.c)} 次</span>`;
+  if(hit.count) html += `<span class="badge">最近日志命中 ${hit.count} 条</span>`;
+  html += '</div>';
+
+  html += '<div class="grid2"><div>';
+  const srcTag = (srv && srv.ok)
+    ? ' <span style="color:var(--green)">·路由器 MosDNS 实时应答</span>'
+    : ' <span style="opacity:.65">· 浏览器 DoH</span>';
+  html += '<div class="sect">解析记录' + srcTag + '</div><div class="reclist">';
+  cnames.forEach(c=> html += `<div><span class="t">CNAME</span> <span class="v cp" title="点击复制">${esc(c.replace(/\.$/,''))}</span></div>`);
+  ips.forEach(ip=> html += `<div><span class="t">${ip.includes(':')?'AAAA':'A'}</span> <span class="v cp" title="点击复制">${esc(ip)}</span></div>`);
+  if(!cnames.length && !ips.length) html += '<div class="cn">未获得任何解析记录（可能被拦截 / 域名不存在 / DoH 不可达）</div>';
+  html += '</div></div><div>';
+  html += '<div class="sect">归属信息</div><div class="kv">';
+  html += `<div><span class="k">IP</span><span class="v">${esc(ips[0]||input)}</span></div>`;
+  if(g){
+    html += `<div><span class="k">国家/地区</span><span class="v">${g.flag} ${esc(g.country||'')}</span></div>`;
+    html += `<div><span class="k">城市</span><span class="v">${esc(g.city||'-')}</span></div>`;
+    html += `<div><span class="k">运营商 / 组织</span><span class="v">${esc(g.isp||'-')}</span></div>`;
+    html += `<div><span class="k">ASN</span><span class="v">${esc(g.asn||'-')}</span></div>`;
+  }else{
+    html += '<div><span class="k">归属</span><span class="v">查询失败</span></div>';
+  }
+  html += '</div></div></div>';
+
+  if(hit.count){
+    html += `<div class="mosd"><b>MosDNS 本地记录</b>（最近 ${hit.count} 条）
+      <div class="reclist">` +
+      hit.logs.map(x=>`<div><span class="cn">${esc((x.t||'').slice(11,19))}</span> ·
+        <span class="v cp" title="点击复制">${esc(x.d)}</span>
+        <span class="cn">${esc(x.q)} → ${esc((x.a||[]).slice(0,2).map(a=>a.v).join(', '))}${x.b?' · 拦截':''}</span></div>`).join('')
+      + '</div></div>';
+  }
+  html += '</div>';
+  $('#result').innerHTML = html;
+}
+$('#go').onclick = doQuery;
+$('#q').addEventListener('keydown', e=>{ if(e.key==='Enter') doQuery(); });
+
+/* 输入框被清空时，把结果区还原成默认提示；
+   顺便把"上一次查询"的标记也清掉，避免清除后又自动查一次 */
+const Q_IDLE = '<div class="qhint">输入域名或 IP 后按回车（或点「查询」）<br>' +
+  '<span class="cn">也可以直接点上面的示例。查询会实时向路由器的 MosDNS 发一次解析请求，' +
+  '并对照本地累积的查询记录与热门榜。</span></div>';
+let Q_DONE = '';
+function resetResult(){
+  if(!Q_DONE) return;                 // 本来就没查过，不用动
+  Q_DONE = '';
+  $('#result').innerHTML = Q_IDLE;
+}
+$('#q').addEventListener('input', ()=>{
+  if(!$('#q').value.trim()) resetResult();
+});
+$('#q').addEventListener('search', resetResult);   // 部分浏览器的原生清除按钮
+
+document.querySelectorAll('.examples a').forEach(a=>{
+  a.onclick = ()=>{ $('#q').value = a.dataset.q; doQuery(); };
+});
+
+/* ---------- 启动 ---------- */
+/* ---------- 上游服务器 ----------
+   状态列只有一个可靠信号可用：本地日志里的成功 / 失败次数。
+   MosDNS 没暴露上游健康检查结果（路由器的配置里没有 health_check 插件），
+   所以这里**不假装知道「在线/离线」**，只按真实成功率分三档 + 一档「未使用」。
+   ⚠️ 样本为 0 时绝不能显示「正常」—— 那是没有数据，不是健康。 */
+const fmtHM = s => String(s || '').replace('T', ' ').slice(5, 19) || '—';
+
+function upStatus(r){
+  if(!r.c) return {cls:'st-idle', txt:'未使用'};
+  const ratio = r.ok / r.c;
+  if(ratio >= 0.995) return {cls:'st-ok',   txt:'正常'};
+  if(ratio > 0)      return {cls:'st-warn', txt:'有失败'};
+  return {cls:'st-bad', txt:'全部失败'};
+}
+function upProto(r){
+  /* 保留原始大小写（DoH / DoT / DoQ / UDP / TCP）—— 全大写 DOH 不规范，看着也怪。
+     只有加密那三类上主色，明文的 UDP/TCP 保持默认色。 */
+  const p = r.proto || '-';
+  const cls = /^Do[HQT]$/.test(p) ? 'proto-' + p.toLowerCase() : '';
+  /* 只有 DoH 才有 HTTP 版本之分（DoT / DoQ 不走 HTTP）。同一个 addr 拆成 h3 / h2 两行后，
+     两行的主机、IP、端口一模一样，全靠这个徽章区分 —— 不加就变成两条看不出差别的重复行。 */
+  /* 只有 DoH 分 HTTP 版本（DoT / DoQ 不走 HTTP）。
+     同一个上游可能同时配了 h3 与 h2 两条（QUIC/UDP 与 TCP 各一条），它们并发调用、
+     统计又无法按协议拆开，所以仍合并成一行，用「h3+h2」表达两种连接方式都在用。
+     ⚠️ 别再拆成两行：三列统计必然相同，拆开只是视觉噪音（2026-10-03 用户拍板）。 */
+  let ver = '';
+  if(p === 'DoH'){
+    if(r.http3 && r.http2) ver = ' <span class="h3tag">h3</span><span class="h2tag">+h2</span>';
+    else if(r.http3)       ver = ' <span class="h3tag">h3</span>';
+    else if(r.http2)       ver = ' <span class="h2tag">h2</span>';
+  }
+  return '<span class="' + cls + '">' + esc(p) + '</span>' + ver;
+}
+function renderUpstreams(){
+  const d = DATA.upstreams || {};
+  const rows = d.rows || [];
+  const tb = $('#up-body');
+  if(!tb) return;
+  if(!rows.length){
+    tb.innerHTML = '<tr><td colspan="10" class="upempty">'
+      + (d.error ? ('读取上游配置失败：' + esc(d.error)) : '没有读到上游配置') + '</td></tr>';
+  }else{
+    tb.innerHTML = rows.map(r=>{
+      const st = upStatus(r);
+      const rate = r.c ? ((100 * r.ok / r.c).toFixed(r.ok === r.c ? 0 : 1) + '%') : '—';
+      return '<tr>'
+        + '<td><span class="uphost">' + esc(r.host || r.addr || '-') + '</span></td>'
+        /* IP 列只显示主 IP：一个域名常解析出 2 个地址（223.5.5.5, 223.6.6.6），
+           全列出来会在这 152px 的列里断成「104.1 / 6.249.249」这种难看的折行。
+           多余的用灰色 +N 提示，完整列表放 title 里悬停可见。 */
+        + (function(){
+            const ips = String(r.ip || '').split(',').map(s=>s.trim()).filter(Boolean);
+            return '<td title="' + esc(r.ip || '') + '">' + esc(ips[0] || '—')
+              + (ips.length > 1 ? ' <span class="upmore">+' + (ips.length - 1) + '</span>' : '')
+              + '</td>';
+          })()
+        + '<td class="upnum">' + esc(String(r.port == null ? '—' : r.port)) + '</td>'
+        + '<td>' + upProto(r) + '</td>'
+        + '<td class="' + (r.secure ? 'sec-yes' : 'sec-no') + '">'
+          + (r.secure ? '加密' : '明文') + '</td>'
+        + '<td class="' + st.cls + '">' + st.txt + '</td>'
+        + '<td class="upnum ' + st.cls + '">' + rate + '</td>'
+        + '<td class="upnum">' + (r.ms == null ? '—' : r.ms.toFixed(2) + ' ms') + '</td>'
+        + '<td class="upnum">' + r.c + '</td>'
+        + '<td class="upnum">' + r.ok + '</td>'
+        + '</tr>';
+    }).join('');
+  }
+  /* 窗口如实标注：这张表的统计口径是「本面板累积的日志库」，不是 MosDNS 的全量累计。
+     不说清楚的话，「总查询次数」会被误当成路由器的累计值。 */
+  let note;
+  if(d.win_from && d.win_to){
+    note = '统计口径：本面板累积的 ' + (d.win_n || 0).toLocaleString('zh-CN') + ' 条日志（'
+      + fmtHM(d.win_from) + ' → ' + fmtHM(d.win_to) + '）内的实际调用，'
+      + '不是路由器的全量累计；点「清除重计」会连带把这份统计归零。'
+      /* ⚠️ 必须说清「成功」的含义，否则会被当成直连可用性：
+         路由器上所有到 443 的 TCP 都被 passwall 重定向进代理（实测连 8.8.8.8:443 是 0ms 连上本机 1041），
+         所以国外上游是**走代理**出去的。2026-10-03 实测：国外 DoH 直连 100% 不通（15 个候选 × 5 次全败）。 */
+      + ' 国外上游经 passwall 代理出网，故这里的成功率 ≠ 直连成功率（直连实测全不通）。';
+  }else{
+    note = '本地日志库还没有数据，统计列暂时为空。';
+  }
+  if(d.cached){
+    note += ' 另有 ' + d.cached.toLocaleString('zh-CN')
+      + ' 次查询命中缓存、没有走上游，故不计入上表。';
+  }
+  /* 同一个 addr 拆成 h3 / h2 两行后，两行的统计是同一份（日志不按协议区分）。
+     「两行都写 293」很容易被读成总共 586，必须交代清楚。 */
+  const multi = [];
+  rows.forEach(function(r){
+    if(r.proto === 'DoH' && r.http3 && r.http2 && multi.indexOf(r.host) < 0) multi.push(r.host);
+  });
+  if(multi.length){
+    note += ' ' + multi.join('、') + ' 同时配置了 h3 与 h2 两种连接方式（QUIC 与 TCP），'
+      + '每次查询并发发出、谁先返回用谁；MosDNS 日志只记录上游地址、不区分协议，'
+      + '故这一行的统计是两种连接方式共享的。';
+  }
+  /* 已从路由器配置里删掉、只在历史日志中出现过的上游：主表严格只反映当前配置，
+     这些不进表。但它们的调用记录确实存在，藏着不说等于数据凭空消失，
+     所以补一句灰色小字交代清楚（点「清除重计」后这行会自然消失）。 */
+  if(d.orphans && d.orphans.length){
+    const n = d.orphans.reduce((a, b)=>a + (b.c || 0), 0);
+    note += ' 另有 ' + d.orphans.length + ' 个已移除的上游（'
+      + d.orphans.map(o=>o.host).join('、')
+      + '）在历史日志中留下 ' + n.toLocaleString('zh-CN') + ' 次调用，已不在当前配置中，故不计入上表。';
+  }
+  const el = $('#up-note'); if(el) el.textContent = note;
+  const tag = $('#up-tag');
+  if(tag){
+    /* 把「清单同步时间」显示出来 —— TTL 从 600s 降到 60s 之后，这个时间戳最多 1 分钟前。
+       用户能自己核对「我刚改的路由器配置到底同步过来没有」，不用靠猜。 */
+    tag.textContent = rows.length + ' 个上游 · 来自路由器 MosDNS 配置'
+      + (d.cfg_ts ? '（清单 ' + esc(d.cfg_ts) + ' 同步）' : '');
+  }
+}
+/* ⚠️ 这个 resize 监听**原来写在 renderAll() 里面** —— renderAll 每次 SSE 推送都会被调用，
+   等于每次推流都往 window 上挂一个新监听器，越积越多（resize 一次执行几十遍）。
+   窗口尺寸是全局事件，注册一次就够，所以挪到模块级只跑一次。 */
+window.addEventListener('resize', ()=>{
+  fitBars('#topd', BAR_ROWS); fitBars('#topb', BAR_ROWS);
+  fitTable('#dtwrap', DEV_ROWS);
+});
+
+function renderAll(){
+  renderKpis(); renderQpsChip(); renderTrend(); renderUpstreams();
+  // 服务端已拉 150 条，这里按标题截断成 50
+  const td = topItems('domains').slice(0, TOP_N);
+  const tb = topItems('blocked').slice(0, TOP_N);
+  renderBars('#topd', td, 'var(--accent)', BAR_ROWS);   // 固定 10 行高，其余滚动
+  renderBars('#topb', tb, 'var(--red)', BAR_ROWS);
+  const tagText = RANGE === 'live' ? ' 条）' : ' 条 · ' + RANGE_LABEL[RANGE] + '）';
+  $('#topd-cnt').textContent = '（' + td.length + tagText;
+  $('#topb-cnt').textContent = '（' + tb.length + tagText;
+  // 窗口尺寸变化的处理见上面 renderUpstreams 之后的模块级监听
+  // （原来写在这里，被 SSE 每次推送重复注册，已挪走）
+
+  if(RANGE === 'live'){
+    /* 🔴 用这个榜自己的起点（since_top），不能再用全局 DATA.since ——
+       各模块独立清除后，TOP 榜的起点和统计/趋势的起点可以不是同一个时间。 */
+    const topSince = DATA.since_top || DATA.since;
+    $('#nod').textContent = td.length < TOP_N && topSince
+      ? '自统计起点 ' + topSince + ' 以来只有 ' + td.length +
+        ' 个域名产生过查询，随着新查询累积会自动补满 ' + TOP_N + ' 条'
+      : (td.length < TOP_N ? '当前统计周期内域名不足 ' + TOP_N + ' 个' : '');
+    $('#nob').textContent = tb.length ? ''
+      : '当前统计周期内没有被拦截的域名';
+  }else{
+    $('#nod').textContent = td.length < TOP_N
+      ? RANGE_LABEL[RANGE] + '内只累积到 ' + td.length + ' 个域名，随时间推移会自动补满 ' + TOP_N + ' 条'
+      : '';
+    $('#nob').textContent = tb.length ? ''
+      : RANGE_LABEL[RANGE] + '内没有被拦截的域名';
+  }
+  // 「清除重计」只影响实时累计视图，看历史区间时隐藏
+  const liveMode = RANGE === 'live';
+  [$('#clr-top'), $('#clr-blk'), $('#clr-trend')].forEach(b=>{
+    if(b) b.style.display = (liveMode && LIVE_OK) ? '' : 'none';
+  });
+  renderLogs();
+  paintRangeNote();
+}
+
+/* ---------- 时间范围按钮 ---------- */
+document.querySelectorAll('#rng .rb').forEach(b=>{
+  b.onclick = async ()=>{
+    if(b.dataset.r === RANGE) return;
+    const all = document.querySelectorAll('#rng .rb');
+    all.forEach(x=>{ x.disabled = true; });
+    try{
+      await loadRange(b.dataset.r);
+    }catch(e){
+      toast('切换失败：' + e.message, false);
+    }
+    all.forEach(x=>{ x.disabled = false; });
+  };
+});
+function applyMeta(){
+  /* 这一栏是「推算」出来的，必须说清来源，别让人以为 MosDNS 直接给了设备 IP。
+     ⚠️ 统计必须用 LOGS，不能用 DATA.logs —— /api/snapshot 的返回里**没有** logs 字段
+     （日志由 /api/logs/all + SSE 单独给），DATA.logs 恒为 undefined，
+     用它算出来会一直是「0.0%（0/0 条）」。LOGS 才是眼前真正渲染的那批。 */
+  const arr = Array.isArray(LOGS) ? LOGS : [];
+  const total = arr.length;
+  let real = 0;
+  arr.forEach(x=>{ if(x.ip2 && x.ip2.length) real++; });
+  const pct = total ? (real*100/total).toFixed(1) : '0.0';
+  $('#clinote').textContent = '客户端来源：MosDNS 日志里的客户端恒为 127.0.0.1'
+    + '（路由器上 dnsmasq 配置 server=127.0.0.1#5335，查询转发进 MosDNS 时源地址被改写为本机）。'
+    + '这里用「时间(秒)+域名+记录类型」与 AdGuard Home 的查询日志做了关联反查，'
+    + '还原出真实设备并显示为设备名 + IP。实测关联成功率 ' + pct + '%（' + real + '/' + total + ' 条）；'
+    + '标「未识别」的是 AGH 还没同步到的最近几条，标「等N台」的是同一秒多台设备查了同一域名、无法区分；'
+    + '悬停或点开任意一行可看完整信息。';
+}
+let LIVE_OK = false, LIVE_ERR = '';
+async function pullLive(){
+  try{
+    const r = await fetch('/api/snapshot?t=' + Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    if(!j || !j.stats) throw new Error('返回数据不完整');
+    DATA = j; MODE = 'live'; LIVE_OK = true; LIVE_ERR = '';
+    return true;
+  }catch(e){
+    LIVE_OK = false; LIVE_ERR = e.message || String(e);
+    MODE = DATA ? 'snapshot' : null;
+    return false;
+  }
+}
+function paintTag(){
+  const t = $('#tag-live');
+  if(LIVE_OK){
+    // 文案由实时链路自己维护（SSE / 降级轮询），这里不覆盖
+    t.style.color = 'var(--green)';
+    $('#dot').style.background = 'var(--green)';
+  }else if(DATA){
+    t.textContent = '服务端快照（实时接口未连通：' + LIVE_ERR + '）';
+    t.style.color = 'var(--orange)';
+    $('#dot').style.background = 'var(--orange)';
+  }
+  const st = $('#tag-since'), rs = $('#restore');
+  /* 只要**任一**模块有基线就显示「统计起点」和「恢复累计」——
+     各模块独立清除后，可能只有 TOP 榜被清过（DATA.since 为空）。 */
+  const anySince = DATA && (DATA.since || DATA.since_top || DATA.since_blk);
+  if(anySince){
+    st.style.display = '';
+    st.textContent = '统计起点 ' + (DATA.since || DATA.since_top || DATA.since_blk);
+    rs.style.display = '';
+  }else{
+    st.style.display = 'none'; rs.style.display = 'none';
+  }
+  // 没有服务端就点不了清除（本地静态快照）；看历史区间时也不需要
+  [$('#clr-top'), $('#clr-blk'), $('#clr-trend')].forEach(b=>{
+    if(b) b.style.display = (LIVE_OK && RANGE === 'live') ? '' : 'none';
+  });
+}
+
+/* ---------- 清除重计 ----------
+   只重置本面板的显示基线，路由器上的 MosDNS 数据一个字节都不动。
+   ⚠️ 原来的实现用的是浏览器原生 confirm() + 失败时 alert()：白底系统弹窗、
+      位置贴在窗口顶部、跟页面完全脱节，按钮文案也改不了。这里换成 #cmodal 自定义弹窗。
+   askClear() 返回 Promise<boolean>，所以调用处仍是 `const ok = await askClear()`，
+   调用链不用改结构。 */
+let CM_RESOLVE = null;
+function askClear(src){
+  return new Promise(res=>{
+    /* 上一个还没关就又开了一个：先把旧的以「取消」收掉，避免 Promise 永远悬着 */
+    if(CM_RESOLVE) { const old = CM_RESOLVE; CM_RESOLVE = null; old(false); }
+    CM_RESOLVE = res;
+    const s = $('#cm-src'); if(s) s.textContent = src || '面板统计';
+    const m = $('#cm-mod'); if(m) m.textContent = src || '该模块';
+    $('#cmodal').classList.add('on');
+    document.body.style.overflow = 'hidden';
+    /* ⚠️ 默认焦点给「取消」而不是「确认清除」—— 这是破坏性操作，
+       不能让顺手一个回车就执行掉。 */
+    setTimeout(()=>{ const b = $('#cm-cancel'); if(b) b.focus(); }, 80);
+  });
+}
+function closeClear(v){
+  const r = CM_RESOLVE; CM_RESOLVE = null;
+  $('#cmodal').classList.remove('on');
+  document.body.style.overflow = '';
+  if(r) r(v);
+}
+async function clearStats(ev){
+  const btn = ev && ev.currentTarget;
+  /* 🔴 scope 决定清哪个模块 —— 后端按模块各自记基线，清 TOP 榜不会动趋势图。
+     以前这里不带参数、后端一律全量重建基线，点哪个榜都等于"清全部"。 */
+  const scope = (btn && btn.dataset.scope) || 'all';
+  const src   = (btn && btn.dataset.src)   || '';
+  const ok = await askClear(src);
+  if(!ok) return;
+  const btns = [$('#clr-top'), $('#clr-blk'), $('#clr-trend')].filter(Boolean);
+  /* 先存原文案再改 —— 不要写死 '清除重计'，以后改按钮文案才不会把名字改回去 */
+  const oldText = btns.map(b=>b.textContent);
+  btns.forEach(b=>{ b.disabled = true; b.textContent = '清除中…'; });
+  try{
+    const r = await fetch('/api/clear?scope=' + encodeURIComponent(scope), {method: 'POST'});
+    const j = await r.json();
+    if(!(j && j.ok)) throw new Error((j && j.error) || '未知错误');
+    await pullLive();
+    /* 别写 LOGS = DATA.logs：snapshot 里没有 logs 字段，会把 LOGS 变成 undefined，
+       紧接着 paintLogTag() 读 LOGS.length 就抛 TypeError。日志另行加载。 */
+    LOG_TOTAL = DATA.log_total || 0; SHOWN = 300; ALL = false;
+    toast('已清除：' + (src || '统计') + ' 从刚才重新开始计数');
+  }catch(e){
+    /* 失败也用 toast，不再用原生 alert() */
+    toast('清除失败：' + (e.message || e), false);
+  }
+  applyMeta(); renderAll(); paintTag(); paintLogTag();
+  btns.forEach((b,i)=>{ b.disabled = false; b.textContent = oldText[i] ?? '清除重计'; });
+}
+/* 恢复累计：把显示基线撤掉，重新按 MosDNS 的完整累计来显示。
+   这个操作不是破坏性的（只是撤销清除），所以不需要二次确认，
+   但**必须有结果反馈** —— 原来 catch 里是空的，失败/被拒都静默，
+   点了按钮什么反应都没有，看着像卡住了。 */
+async function restoreCumulative(){
+  let ok = false, err = '';
+  try{
+    const r = await fetch('/api/clear?mode=reset', {method: 'POST'});
+    const j = await r.json();
+    if(j && j.ok){
+      await pullLive();
+      LOG_TOTAL = DATA.log_total || LOG_TOTAL;   // 同上：不要动 LOGS
+      ok = true;
+    }else{
+      err = (j && j.error) || '服务端拒绝了请求';
+    }
+  }catch(e){
+    err = e.message || String(e);
+  }
+  applyMeta(); renderAll(); paintTag(); paintLogTag();
+  toast(ok ? '已恢复：重新按 MosDNS 完整累计显示' : ('恢复失败：' + err), ok);
+}
+async function refreshBtn(){
+  const b = $('#refresh'); const old = b.textContent;
+  b.textContent = '刷新中…'; b.disabled = true;
+  const ok = await pullLive();
+  applyMeta(); renderAll(); paintTag();
+  b.textContent = ok ? '已刷新' : '刷新失败';
+  setTimeout(()=>{ b.textContent = old; b.disabled = false; }, 1200);
+}
+async function boot(){
+  await pullLive();          // 能连通就切实时，连不通就用 HTML 里内联的快照
+  if(!DATA){
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif">' +
+      '<h2>暂无数据</h2><p>服务端接口不可用，且本文件未内联快照。</p>' +
+      '<p>本地用法：运行 <code>python sync.py</code> 生成 dashboard.html；' +
+      '服务端用法：确认 <code>mosdns-dashboard</code> 服务在运行</p></div>';
+    return;
+  }
+  applyMeta(); renderAll(); paintTag(); paintLogTag();
+  renderDevices(); renderALogs();      // 先按空态画一版，联网后由 loadALogs 覆盖
+  $('#refresh').onclick = refreshBtn;
+  /* ⚠️ 必须传 event：clearStats 靠 ev.currentTarget.dataset.src 判断是点了哪个榜的按钮，
+     用来在确认弹窗的副标题里显示来源。直接写 = clearStats 拿不到来源。 */
+  $('#clr-top').onclick = e => clearStats(e);
+  $('#clr-blk').onclick = e => clearStats(e);
+  $('#clr-trend').onclick = e => clearStats(e);
+  $('#restore').onclick = restoreCumulative;
+  if(LIVE_OK){
+    // 首屏只带 300 条，联网后自动补齐到 AUTO_LOG_PULL 条（全量要手动点「载入全部」）
+    loadAllLogs(AUTO_LOG_PULL).then(ok=>{
+      if(ok){ ALL = true; SHOWN = 300; paintLogTag(); renderLogs(); }
+    });
+    // 设备表 + 客户端日志（真实 IP / MAC，来自 AdGuard Home）
+    loadALogs(A_PULL);
+  }
+  if(location.host){
+    $('#f-tip').innerHTML = '托管于 <code>' + esc(location.host) +
+      '</code>，数据由服务端经 SSH 直连路由器的 MosDNS 拉取；' +
+      '服务端每 2 秒检测一次变化并推送到本页（SSE 长连接），打不通时自动降级为轮询';
+  }
+  startLive();
+}
+
+/* ---------- 实时推送（SSE） ----------
+   服务端 /api/stream 每 2 秒检测一次路由器的数据变化，一有变化就推过来，
+   页面收到立刻重画。四个历史区间（今天/近7天/近30天/自建库以来）在后台
+   一并静默刷新，所以切到哪个区间都是"活的"。连不上就降级成 20 秒轮询。 */
+let ES = null, ES_FAIL = 0, POLL_MS = 20000, LOG_LAST = 0;
+
+function setLinkMode(txt, color){
+  const t = $('#tag-live'); if(!t) return;
+  t.textContent = txt;
+  t.style.color = color;
+  const d = $('#dot'); if(d) d.style.background = color;
+}
+
+async function applyPush(obj){
+  if(!obj || !obj.stats) return;
+  DATA = obj; MODE = 'live'; LIVE_OK = true; LIVE_ERR = '';
+  // MosDNS 日志明细不在推送里（体积大），每 60 秒补一次就够。
+  // 注意 LOG_LAST 初始为 0，第一次只记时间戳、不重复拉（boot() 里已拉过）。
+  if(!LOG_LAST) LOG_LAST = Date.now();
+  else if(Date.now() - LOG_LAST > 60000){
+    LOG_LAST = Date.now();
+    await loadAllLogs(ALL ? null : AUTO_LOG_PULL);   // 保持当前展开量，不跳回顶部
+  }
+  if(RANGE !== 'live') await refreshRangeSilent();
+  applyMeta(); renderAll(); paintLogTag(); paintTag();
+  setLinkMode('实时 · 推送同步（SSE）', 'var(--green)');
+  // 客户端日志：内部有 15 秒节流 + 无新数据不重绘，不会打断筛选/滚动
+  loadALogs(A_PULL, true);
+}
+
+function startLive(){
+  if(!LIVE_OK){                        // 服务端都连不上，走老轮询
+    setInterval(()=>pullLive().then(ok=>{ if(ok){ applyMeta(); renderAll(); paintTag(); } }), POLL_MS);
+    return;
+  }
+  if(!window.EventSource){             // 浏览器太老
+    setInterval(()=>pullLive().then(ok=>{ if(ok){ applyMeta(); renderAll(); paintTag(); } }), POLL_MS);
+    return;
+  }
+  try{
+    ES = new EventSource('/api/stream');
+  }catch(e){ ES = null; }
+  if(!ES) return;
+
+  ES.onopen = ()=>{ ES_FAIL = 0; setLinkMode('实时 · 推送同步（SSE）', 'var(--green)'); };
+  ES.onmessage = ev=>{
+    ES_FAIL = 0;
+    let obj = null;
+    try{ obj = JSON.parse(ev.data); }catch(e){ return; }
+    if(obj && obj._hb){                // 心跳：只更新一下"最后同步时间"，不重绘
+      if(!document.hidden) setLinkMode('实时 · 推送同步（SSE）', 'var(--green)');
+      return;
+    }
+    if(document.hidden){ return; }     // 页面在后台就先不画，回来时补一帧
+    applyPush(obj);
+  };
+  ES.onerror = ()=>{
+    ES_FAIL++;
+    if(ES_FAIL >= 3){                  // 连续失败：关掉 SSE，退回轮询
+      try{ ES.close(); }catch(e){}
+      ES = null;
+      setLinkMode('实时接口中断，已降级为 20 秒轮询', 'var(--orange)');
+      setInterval(()=>pullLive().then(ok=>{ if(ok){ applyMeta(); renderAll(); paintTag(); } }), POLL_MS);
+    }else{
+      setLinkMode('实时连接重连中…', 'var(--orange)');
+    }
+  };
+  // 从后台切回前台时补一帧，避免看到过期数字
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pullLive(); });
+}
+
+/* ---------- 移动端：表格横向滚动提示 ----------
+   手机上表格被裁掉一半，用户往往不知道能横滑。在容器外侧挂左右两片渐隐遮罩，
+   滚到左/右端点时对应那片自动淡出。遮罩必须挂在容器外，放容器里会跟着一起滚。 */
+function initScrollHints(){
+  document.querySelectorAll('.dtwrap,.atwrap,.tblwrap,.upwrap').forEach(w=>{
+    if(w.dataset.sx) return;
+    w.dataset.sx = '1';
+    const holder = document.createElement('div');
+    holder.className = 'sxw';
+    w.parentNode.insertBefore(holder, w);
+    holder.appendChild(w);
+    const l = document.createElement('span'); l.className = 'sxl';
+    const r = document.createElement('span'); r.className = 'sxr';
+    holder.appendChild(l); holder.appendChild(r);
+    const upd = ()=>{
+      const can = w.scrollWidth - w.clientWidth;
+      l.style.opacity = w.scrollLeft > 2 ? '1' : '0';
+      r.style.opacity = w.scrollLeft < can - 2 ? '1' : '0';
+    };
+    w.addEventListener('scroll', upd, { passive: true });
+    window.addEventListener('resize', upd);
+    upd();
+  });
+}
+
+/* ---------- 移动端：尺寸变化后重绘趋势图 ----------
+   图表的 viewBox 宽度是按容器实际宽度算的（1:1 渲染），所以转屏 / 改窗口宽度
+   必须重算，否则转横屏后图形会被拉扁。防抖 200ms，避免拖动时疯狂重绘。 */
+(function(){
+  if(window.__trendResizeBound) return;
+  window.__trendResizeBound = 1;
+  let t = 0, lastW = window.innerWidth;
+  window.addEventListener('resize', ()=>{
+    if(window.innerWidth === lastW) return;   // 手机滚动时地址栏收放会触发 resize，忽略纯高度变化
+    lastW = window.innerWidth;
+    clearTimeout(t);
+    t = setTimeout(()=>{ try{ renderTrend(); }catch(e){} }, 200);
+  });
+})();
+
+boot();
+setTimeout(initScrollHints, 0);
+</script>
+<div id="toast"></div>
+
+<!-- 查询日志详情：点「最近解析日志」任意一行弹出 -->
+<div id="qmodal" class="qmodal" role="dialog" aria-modal="true" aria-labelledby="qm-title">
+  <div class="qbox">
+    <div class="qhead">
+      <div class="qtitle" id="qm-title">查询日志详情</div>
+      <div class="qline">
+        <span class="qdname" id="qm-name">-</span>
+        <span class="qtype" id="qm-type"></span>
+        <span class="qmeta">
+          <span id="qm-badges"></span>
+          <span class="qms" id="qm-ms"></span>
+        </span>
+      </div>
+    </div>
+    <div class="qbody">
+      <div class="qgrid">
+        <div class="qg"><div class="k">客户端 IP</div><div class="v" id="qm-client">-</div></div>
+        <div class="qg"><div class="k">时间</div><div class="v" id="qm-time">-</div></div>
+        <div class="qg"><div class="k">上游服务器</div><div class="v" id="qm-up">-</div></div>
+        <div class="qg"><div class="k">命中规则</div><div class="v" id="qm-rule">-</div></div>
+      </div>
+      <div class="qsect">应答结果<span class="qcnt" id="qm-acnt">0</span></div>
+      <div class="qans" id="qm-ans"></div>
+    </div>
+    <div class="qfoot">
+      <button class="btn" id="qm-copy">复制域名</button>
+      <button class="btn primary" id="qm-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设备命名：点「局域网设备」表里的设备名 / + 命名 弹出。
+     原来用原生 prompt()，改不了位置，现在复用 .qmodal 的自适应居中。 -->
+<div id="nmodal" class="qmodal" role="dialog" aria-modal="true" aria-labelledby="nm-title">
+  <div class="qbox nbox">
+    <div class="qhead">
+      <div class="qtitle" id="nm-title">设备命名</div>
+      <div class="qline"><span class="qdname" id="nm-ip">-</span></div>
+    </div>
+    <div class="qbody">
+      <div class="nf">
+        <label class="nl" for="nm-input">设备名</label>
+        <input id="nm-input" class="nin" type="text" maxlength="40"
+               placeholder="留空则删除已有名称" autocomplete="off">
+      </div>
+      <div class="nhint">名字会写进面板主机的 <code>devices.conf</code>，之后日志里这台设备就显示这个名字。
+        留空保存 = 清除已有名称。</div>
+    </div>
+    <div class="qfoot">
+      <button class="btn" id="nm-clear">清除名称</button>
+      <button class="btn" id="nm-cancel">取消</button>
+      <button class="btn primary" id="nm-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 清除重计确认：点 TOP 榜 / 查询趋势右上角的「清除重计」弹出。
+     🔴 各模块独立：热门榜按钮只清热门榜、拦截榜只清拦截榜、趋势按钮只清趋势与统计。
+        弹窗正文必须说清"只影响这个模块"，否则用户会以为又是一次全清。
+     原来用原生 confirm()（失败时还有个 alert()），位置和样式都改不了，
+     现在复用 .qmodal 的自适应居中，并给确认按钮上红底（破坏性操作）。 -->
+<div id="cmodal" class="qmodal" role="dialog" aria-modal="true" aria-labelledby="cm-title">
+  <div class="qbox cbox">
+    <div class="qhead">
+      <div class="qtitle" id="cm-title">清除重计</div>
+      <div class="qline"><span class="qdname" id="cm-src">-</span></div>
+    </div>
+    <div class="qbody">
+      <p class="ctext">把<strong id="cm-mod">该模块</strong>的统计起点重置为<strong>当前时刻</strong>？</p>
+      <ul class="clist">
+        <li>之后<strong>只有这个模块</strong>从零开始计，
+            <strong>其它模块（含查询趋势）不受影响</strong>；</li>
+        <li>只改动 面板的显示基线 ——路由器上 MosDNS 的
+            统计数据、配置和缓存都不会有任何变化；</li>
+        <li>清除后可用顶部的「恢复累计」按钮还原。</li>
+      </ul>
+      <div class="qtrunc">实时视图里清除之前的 TOP 榜数据将不再显示；
+        历史库（今天 / 近 7 天 / 自建库以来）里的记录不受影响。</div>
+    </div>
+    <div class="qfoot">
+      <button class="btn" id="cm-cancel">取消</button>
+      <button class="btn danger" id="cm-ok">确认清除</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
