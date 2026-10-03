@@ -4,6 +4,8 @@
 
 **纯 Python 3 标准库实现，零第三方依赖。** 不需要 pip install 任何东西，`git clone` 下来改两行配置就能跑。
 
+> 镜像：[GitHub](https://github.com/996kuku/mosdns-dashboard)（国际版）· [Gitee](https://gitee.com/yilunn996/mosdns-dashboard)（国内版）
+
 > 配套的上游是 `sbwml/luci-app-mosdns`（OpenWrt 上的 LuCI 包）。本面板不参与解析、不改路由器任何配置 —— 它只是**读** MosDNS 的统计接口，然后把数据攒进本地 SQLite 展示出来。
 
 ---
