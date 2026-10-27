@@ -1,5 +1,12 @@
 # MosDNS 仪表盘
 
+<a href="https://www.997wan.com/"><img alt="文档" src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-997wan.com-4ad6a8?style=flat-square"></a>
+<img alt="OpenWrt" src="https://img.shields.io/badge/OpenWrt-24.10-00a4ff?style=flat-square">
+<img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white">
+<img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
+
+**部署教程、参数说明与更新日志：[997wan.com](https://www.997wan.com/)**　（部署步骤、参数与常见问题都在文档里）
+
 给 OpenWrt 上的 [MosDNS](https://github.com/IrineSistiana/mosdns) 做一个**自带实时推送、能按设备统计**的 DNS 查询面板。
 
 **纯 Python 3 标准库实现，零第三方依赖。** 不需要 pip install 任何东西，`git clone` 下来改两行配置就能跑。
