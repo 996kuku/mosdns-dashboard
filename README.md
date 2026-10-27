@@ -208,3 +208,9 @@ MosDNS 日志里的 `client` 确实是本机（dnsmasq 转进来的）。要真�
 ## 许可证
 
 [MIT](LICENSE)
+
+---
+
+## 相关项目
+
+- [spider-verify](https://github.com/996kuku/spider-verify) —— 从 nginx 访问日志识别真假搜索引擎爬虫（UA 指纹 + 官方 IP 段 + FCrDNS 校验）
