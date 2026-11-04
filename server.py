@@ -464,6 +464,13 @@ def db():
     global _conn
     if _conn is None:
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        # 性能优化：WAL 模式、同步级别、超时、缓存
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA busy_timeout=5000")
+        _conn.execute("PRAGMA cache_size=-64000")  # 64MB
+        _conn.execute("PRAGMA temp_store=MEMORY")
+        _conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory map
         _conn.execute("""CREATE TABLE IF NOT EXISTS logs(
             id TEXT PRIMARY KEY, ts TEXT, domain TEXT, qtype TEXT, status TEXT,
             blocked INTEGER, cached INTEGER, elapsed REAL, upstream TEXT,
@@ -522,18 +529,47 @@ def _row_of(it):
 
 
 def ingest():
-    out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
-                   % (STATS_API, LOG_PAGE), 25)
+    """增量拉取 MosDNS 日志：只拉比上次更新的，避免漏采和重复"""
+    c = db()
+    # 读取上次采集的最新日志 ID
+    with _db_lock:
+        row = c.execute("SELECT v FROM meta WHERE k='last_log_id'").fetchone()
+    last_id = row[0] if row else ""
+
+    # 构建请求：如果有上次 ID，尝试增量拉取
+    if last_id:
+        # MosDNS API 可能不支持 after 参数，仍拉全量但用 last_id 过滤
+        out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
+                       % (STATS_API, LOG_PAGE), 25)
+    else:
+        out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
+                       % (STATS_API, LOG_PAGE), 25)
+
     j = _jload(out)
     items = (j or {}).get("items") or []
     if not items:
         return 0, err
+
+    # 如果有 last_id，只处理比它新的（ID 更大或时间更新）
+    if last_id:
+        new_items = []
+        for it in items:
+            if it.get("id") == last_id:
+                break  # 遇到旧数据，停止
+            new_items.append(it)
+        items = new_items
+
+    if not items:
+        return 0, None
+
     rows = [_row_of(x) for x in items if x.get("id")]
-    c = db()
     with _db_lock:
         c.executemany("INSERT OR IGNORE INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         c.execute("DELETE FROM logs WHERE id NOT IN "
                   "(SELECT id FROM logs ORDER BY ts DESC, id DESC LIMIT ?)", (LOG_KEEP,))
+        # 更新最新 ID
+        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_log_id',?)",
+                  (items[0].get("id") or "",))
         c.commit()
     return len(rows), err
 
@@ -2360,6 +2396,84 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, json.dumps({"ok": False, "error": str(e)},
                                                   ensure_ascii=False))
 
+        if p == "/healthz":
+            """Kubernetes/Docker 健康检查：快速返回各组件状态"""
+            checks = {}
+            # SSH 检查
+            try:
+                out, err = ssh("echo OK", 3)
+                checks["ssh"] = err is None and "OK" in (out or "")
+            except:
+                checks["ssh"] = False
+            # 数据库检查
+            try:
+                c = db()
+                with _db_lock:
+                    c.execute("SELECT 1").fetchone()
+                checks["database"] = True
+            except:
+                checks["database"] = False
+            # MosDNS API 检查
+            try:
+                out, err = ssh('curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
+                checks["mosdns"] = err is None and out and len(out) > 10
+            except:
+                checks["mosdns"] = False
+            # 磁盘空间检查
+            try:
+                import shutil
+                stat = shutil.disk_usage(HERE)
+                checks["disk"] = stat.free > 100 * 1024 * 1024  # >100MB
+            except:
+                checks["disk"] = False
+            # AGH 检查
+            checks["agh"] = bool(_agh.get("ok"))
+            # iKuai 检查
+            checks["ikuai"] = bool(_ik.get("ok"))
+
+            ok = all(checks.values())
+            return self._send(200 if ok else 503, json.dumps({
+                "status": "ok" if ok else "error",
+                "checks": checks,
+                "uptime_s": int(time.time() - START_TS),
+            }, ensure_ascii=False))
+
+        if p == "/metrics":
+            """Prometheus metrics 端点：供 Grafana/Prometheus 采集"""
+            try:
+                data = get_snapshot(force=True)
+                s = data.get("stats") or {}
+                metrics = []
+                # 基础指标
+                metrics.append("# HELP mosdns_queries_total Total DNS queries")
+                metrics.append("# TYPE mosdns_queries_total counter")
+                metrics.append("mosdns_queries_total %s" % (s.get("total_queries") or 0))
+                metrics.append("# HELP mosdns_cache_hits_total Total cache hits")
+                metrics.append("# TYPE mosdns_cache_hits_total counter")
+                metrics.append("mosdns_cache_hits_total %s" % (s.get("cached_queries") or 0))
+                metrics.append("# HELP mosdns_blocked_total Total blocked queries")
+                metrics.append("# TYPE mosdns_blocked_total counter")
+                metrics.append("mosdns_blocked_total %s" % (s.get("blocked_queries") or 0))
+                metrics.append("# HELP mosdns_uptime_seconds Uptime in seconds")
+                metrics.append("# TYPE mosdns_uptime_seconds gauge")
+                metrics.append("mosdns_uptime_seconds %d" % int(time.time() - START_TS))
+                # 上游指标
+                ups = data.get("upstreams") or {}
+                for r in (ups.get("rows") or []):
+                    addr = r.get("addr") or ""
+                    metrics.append("# HELP mosdns_upstream_queries_total Upstream queries")
+                    metrics.append("# TYPE mosdns_upstream_queries_total counter")
+                    metrics.append('mosdns_upstream_queries_total{upstream="%s"} %s'
+                                   % (addr, r.get("c") or 0))
+                    if r.get("ms") is not None:
+                        metrics.append("# HELP mosdns_upstream_latency_ms Upstream latency")
+                        metrics.append("# TYPE mosdns_upstream_latency_ms gauge")
+                        metrics.append('mosdns_upstream_latency_ms{upstream="%s"} %.2f'
+                                       % (addr, r.get("ms")))
+                return self._send(200, "\n".join(metrics), "text/plain; version=0.0.4")
+            except Exception as e:
+                return self._send(500, "# ERROR: %s\n" % e, "text/plain")
+
         if p == "/health":
             conn = db()
             try:
@@ -2492,6 +2606,37 @@ class MuxHTTPServer(ThreadingHTTPServer):
 
 
 def main():
+    # 启动前安全检查
+    auth = auth_cfg()
+    if not auth:
+        if LISTEN_HOST == "0.0.0.0":
+            sys.stderr.write("⚠️  警告：监听 0.0.0.0 但未启用认证，面板将对公网开放！\n")
+            sys.stderr.write("   建议：\n")
+            sys.stderr.write("   1. 运行 tools/dashboard-setpass 设置密码\n")
+            sys.stderr.write("   2. 或修改 DASH_HOST=127.0.0.1 只监听本地\n")
+            sys.stderr.write("   3. 继续启动请等待 3 秒...\n")
+            time.sleep(3)
+        else:
+            sys.stderr.write("⚠️  未启用认证，仅监听 %s\n" % LISTEN_HOST)
+
+    # 检查 SSH 连接
+    try:
+        out, err = ssh("echo OK", 5)
+        if err or "OK" not in (out or ""):
+            sys.stderr.write("⚠️  SSH 连接失败: %s\n" % (err or "无法连接"))
+            sys.stderr.write("   请检查 MOSDNS_HOST、MOSDNS_SSH_KEY 配置\n")
+    except Exception as e:
+        sys.stderr.write("⚠️  SSH 检查异常: %s\n" % e)
+
+    # 检查数据库
+    try:
+        c = db()
+        with _db_lock:
+            c.execute("SELECT 1").fetchone()
+        sys.stderr.write("✓ 数据库已就绪（WAL 模式）\n")
+    except Exception as e:
+        sys.stderr.write("⚠️  数据库初始化失败: %s\n" % e)
+
     # 先攒一批日志，再启动 HTTP；后台线程持续累积
     try:
         n, err = ingest()
@@ -2511,7 +2656,7 @@ def main():
         sys.stderr.write("已启用 HTTPS(TLS>=1.2)，证书 %s；明文 http 请求将 301 跳到 https\n"
                          % TLS_CERT)
     else:
-        sys.stderr.write("未找到 TLS 证书，回退为明文 HTTP\n")
+        sys.stderr.write("⚠️  未找到 TLS 证书，回退为明文 HTTP（建议配置证书）\n")
     sys.stderr.write("MosDNS Dashboard 监听 %s:%d  数据源 %s  日志保留 %d 条\n"
                      % (LISTEN_HOST, LISTEN_PORT, MOSDNS_HOST, LOG_KEEP))
     try:

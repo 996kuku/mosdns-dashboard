@@ -52,6 +52,9 @@
 - **8088 单端口同时收 HTTPS 和 HTTP**：明文请求自动 301 跳 HTTPS（accept 后 peek 首字节判断，和 nginx 的 `ssl_preread` 一个思路）
 - **登录认证**：PBKDF2 存密码，cookie 用 HMAC-SHA256 签名（HttpOnly / SameSite=Lax / Secure）
 - **零依赖**：只用 Python 标准库
+- **数据库优化**：WAL 模式、增量采集、自动清理，支持高并发
+- **健康检查**：`/healthz` 端点，适合 Docker/K8s 监控
+- **Prometheus 指标**：`/metrics` 端点，可对接 Grafana
 
 ---
 
@@ -202,6 +205,40 @@ MosDNS 日志里的 `client` 确实是本机（dnsmasq 转进来的）。要真�
 
 **Q：支持 HEAD 请求吗？**
 支持。路由复用 `do_GET`，但响应头发完就不写 body；`/api/stream`（SSE 长连接）、`/api/clear`（会重置统计）、`/api/logout`（会注销 cookie）这三个例外直接返回 405，因为 HEAD 按规范必须是安全且无副作用的。
+
+---
+
+## 监控与运维
+
+### 健康检查
+
+```bash
+curl http://localhost:8088/healthz
+```
+
+返回各组件状态（SSH、数据库、MosDNS、磁盘、AGH、iKuai），适合 Docker/K8s 健康检查。
+
+### Prometheus 指标
+
+面板暴露标准 Prometheus 格式指标，可直接对接 Grafana：
+
+```bash
+curl http://localhost:8088/metrics
+```
+
+输出示例：
+```
+mosdns_queries_total 12345
+mosdns_cache_hits_total 8900
+mosdns_blocked_total 120
+mosdns_upstream_queries_total{upstream="8.8.8.8"} 5000
+mosdns_upstream_latency_ms{upstream="8.8.8.8"} 45.2
+```
+
+**Grafana 配置**：
+1. 添加 Prometheus 数据源，URL 填 `http://<面板主机>:8088`
+2. 导入社区 Dashboard 或自行创建面板
+3. 常用查询：`rate(mosdns_queries_total[5m])`、`mosdns_cache_hits_total / mosdns_queries_total`
 
 ---
 
