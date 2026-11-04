@@ -239,6 +239,240 @@ def test_startup_checks():
         return False
 
 
+def test_healthz_required_vs_optional():
+    """测试 6：healthz 必需/可选依赖分层
+
+    只装 MosDNS（没配 AGH/iKuai）的正常部署必须返回 200 ready，
+    不能因为可选集成就绪与否被判成 503。"""
+    print("=" * 60)
+    print("测试 6：healthz 必需/可选依赖分层")
+    print("=" * 60)
+
+    try:
+        from io import BytesIO
+
+        class MockHandler(server.Handler):
+            def __init__(self):
+                self.path = "/healthz"
+                self.command = "GET"
+                self.headers = {}
+                self.rfile = BytesIO()
+                self.wfile = BytesIO()
+                self._response_code = 0
+                self.address_string = lambda: "127.0.0.1"
+
+            def send_response(self, code, message=None):
+                self._response_code = code
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+            def log_message(self, fmt, *args):
+                pass
+
+        h = MockHandler()
+        h.do_GET()
+        data = json.loads(h.wfile.getvalue().decode())
+        checks = data["checks"]
+        print(f"  状态码: {h._response_code}  status: {data['status']}")
+
+        # 可选集成未配置时应为 None，而不是 False
+        assert checks["agh"] is None, f"未配置 AGH 应为 None，实际 {checks['agh']}"
+        assert checks["ikuai"] is None, f"未配置 iKuai 应为 None，实际 {checks['ikuai']}"
+        # 必需项（数据库）正常时必须 ready
+        assert data["ready"] is True, "数据库正常时应 ready"
+        assert h._response_code == 200, f"数据库+磁盘正常应返回 200，实际 {h._response_code}"
+        print("  ✓ 可选集成未配置不再拖垮健康检查")
+        print("  ✓ 数据库正常时返回 200 ready\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_metrics_format_and_caching():
+    """测试 7：metrics 输出格式 + 不触发强制采集
+
+    两个要点：
+      1. HELP/TYPE 每个指标族只出现一次（旧实现按上游数量重复）
+      2. 走缓存，不调 collect()（否则 Prometheus 抓取会压垮路由器）"""
+    print("=" * 60)
+    print("测试 7：metrics 格式与缓存行为")
+    print("=" * 60)
+
+    try:
+        from io import BytesIO
+
+        class MockHandler(server.Handler):
+            def __init__(self, path):
+                self.path = path
+                self.command = "GET"
+                self.headers = {}
+                self.rfile = BytesIO()
+                self.wfile = BytesIO()
+                self._response_code = 0
+                self.address_string = lambda: "127.0.0.1"
+
+            def send_response(self, code, message=None):
+                self._response_code = code
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+            def log_message(self, fmt, *args):
+                pass
+
+        # 7a. 缓存行为：把 collect 替换成"爆炸函数"，
+        #     如果 metrics 调了它就会抛错 —— 证明走的是缓存。
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("collect 被调用了"))
+        orig_collect = server.collect
+        server.collect = boom
+        try:
+            h = MockHandler("/metrics")
+            h.do_GET()
+            body = h.wfile.getvalue().decode()
+            assert "mosdns_queries_total" in body, "指标缺失"
+            print("  ✓ 未触发 collect()，走的是缓存")
+        finally:
+            server.collect = orig_collect
+
+        # 7b. 格式：HELP/TYPE 不重复
+        h2 = MockHandler("/metrics")
+        h2.do_GET()
+        body2 = h2.wfile.getvalue().decode()
+        for metric in ("mosdns_queries_total", "mosdns_cache_hits_total",
+                       "mosdns_upstream_queries_total"):
+            help_n = body2.count(f"# HELP {metric} ")
+            type_n = body2.count(f"# TYPE {metric} ")
+            print(f"  {metric}: HELP×{help_n} TYPE×{type_n}")
+            assert help_n == 1, f"{metric} 的 HELP 应只出现 1 次，实际 {help_n}"
+            assert type_n == 1, f"{metric} 的 TYPE 应只出现 1 次，实际 {type_n}"
+        print("  ✓ HELP/TYPE 每个指标族只出现一次")
+
+        # 7c. 标签转义
+        esc = server._prom_label('a"b\\c\nd')
+        assert esc == 'a\\"b\\\\c\\nd', f"转义错误: {esc!r}"
+        print(f"  ✓ 标签转义正确: {esc!r}\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_collect_lock_serializes():
+    """测试 8：采集锁确实串行化并发调用"""
+    print("=" * 60)
+    print("测试 8：采集并发串行化")
+    print("=" * 60)
+
+    try:
+        import threading
+        import time as _t
+
+        active = {"n": 0, "max": 0}
+        guard = threading.Lock()
+
+        def fake_collect():
+            with guard:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            _t.sleep(0.08)
+            with guard:
+                active["n"] -= 1
+            return {"stats": {}}
+
+        orig = server._collect
+        server._collect = fake_collect
+        try:
+            threads = [threading.Thread(target=server.collect) for _ in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            server._collect = orig
+
+        print(f"  并发 6 个线程，最大同时执行数: {active['max']}")
+        assert active["max"] == 1, f"采集应串行（最大并发 1），实际 {active['max']}"
+        print("  ✓ 采集已串行化，不会打出并发 SSH 会话\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_guard_allows_probes():
+    """测试 9：探针端点不被认证拦截（k8s 探针带不了 cookie）"""
+    print("=" * 60)
+    print("测试 9：探针端点免认证")
+    print("=" * 60)
+
+    try:
+        # 临时造一个最小 auth.conf 让认证开启
+        conf = server.AUTH_CONF
+        had = os.path.exists(conf)
+        backup = open(conf, encoding="utf-8").read() if had else None
+        with open(conf, "w", encoding="utf-8") as f:
+            f.write("AUTH_ENABLE=1\nAUTH_USER=u\n"
+                    "AUTH_HASH=pbkdf2_sha256$1$c2FsdA==$aGFzaA==\n"
+                    "AUTH_SECRET=s\n")
+        server._auth_cache["mtime"] = 0  # 清缓存让它重读
+        try:
+            from io import BytesIO
+
+            class MockHandler(server.Handler):
+                def __init__(self, path):
+                    self.path = path
+                    self.command = "GET"
+                    self.headers = {}
+                    self.rfile = BytesIO()
+                    self.wfile = BytesIO()
+                    self._response_code = 0
+                    self.address_string = lambda: "127.0.0.1"
+
+                def send_response(self, code, message=None):
+                    self._response_code = code
+
+                def send_header(self, key, value):
+                    pass
+
+                def end_headers(self):
+                    pass
+
+                def log_message(self, fmt, *args):
+                    pass
+
+            for path in ("/healthz", "/metrics"):
+                h = MockHandler(path)
+                blocked = h._guard()
+                assert blocked is False, f"{path} 被认证拦截了，探针会拿到 401"
+                print(f"  ✓ {path} 免认证放行")
+            print("  ✓ 探针在认证开启时仍可访问\n")
+            return True
+        finally:
+            if had:
+                with open(conf, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            else:
+                os.remove(conf)
+            server._auth_cache["mtime"] = 0
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     print("\n" + "=" * 60)
     print("MosDNS Dashboard 冒烟测试")
@@ -252,6 +486,10 @@ def main():
     results.append(("Prometheus 指标", test_metrics_endpoint()))
     results.append(("增量日志采集", test_incremental_ingest()))
     results.append(("启动安全检查", test_startup_checks()))
+    results.append(("healthz 必需/可选分层", test_healthz_required_vs_optional()))
+    results.append(("metrics 格式与缓存", test_metrics_format_and_caching()))
+    results.append(("采集并发串行化", test_collect_lock_serializes()))
+    results.append(("探针端点免认证", test_guard_allows_probes()))
 
     # 汇总结果
     print("=" * 60)

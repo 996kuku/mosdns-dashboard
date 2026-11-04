@@ -216,7 +216,30 @@ MosDNS 日志里的 `client` 确实是本机（dnsmasq 转进来的）。要真�
 curl http://localhost:8088/healthz
 ```
 
-返回各组件状态（SSH、数据库、MosDNS、磁盘、AGH、iKuai），适合 Docker/K8s 健康检查。
+判定分三层，避免把「可选集成没配」误判成「服务挂了」：
+
+| 层级 | 项目 | 说明 |
+|---|---|---|
+| 必需 | `database`、`disk` | 任一失败 → 503 |
+| 数据链路 | `ssh`、`mosdns` | 断开时服务降级但仍可访问（`status: degraded`） |
+| 可选 | `agh`、`ikuai` | 未配置文件时为 `null`，不参与就绪判定 |
+
+返回示例：
+
+```json
+{
+  "status": "degraded",
+  "ready": true,
+  "checks": {
+    "database": true, "disk": true,
+    "ssh": false, "mosdns": false,
+    "agh": null, "ikuai": null
+  }
+}
+```
+
+- `/healthz` 不需要登录态（k8s/Docker 探针带不了 cookie）
+- `/metrics` 同样免认证，但只暴露聚合数字，不含客户端身份
 
 ### Prometheus 指标
 

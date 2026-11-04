@@ -395,8 +395,27 @@ def read_upstreams():
 
 
 # ---------- 采集 ----------
+_collect_lock = threading.Lock()
+
+
+def _prom_label(v):
+    """转义 Prometheus 标签值：反斜杠、双引号、换行（exposition 格式要求）"""
+    return (str(v).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n"))
+
+
 def collect():
-    """一次 SSH 拉齐 stats / top / history / 缓存条数；日志走本地累积库"""
+    """一次 SSH 拉齐 stats / top / history / 缓存条数；日志走本地累积库
+
+    ⚠️ 采集走 4 次 SSH 子调用，是全局最重的操作。必须串行 ——
+       否则 push_loop(2s)、sample_min(60s)、sample_hour(3600s)、
+       /metrics、/api/clear 同时触发时会打出多个并发 SSH 会话，
+       把路由器压垮。取不到锁时等待，等完拿到的就是更新后的结果。"""
+    with _collect_lock:
+        return _collect()
+
+
+def _collect():
     errors = []
     # /top 默认只给 10 条，必须带 ?limit= 才能拿更多（与 logs 的 ?limit 同理）
     cmd = ('curl -s --noproxy "*" -m 10 "%s/stats"; echo "%s"; '
@@ -529,33 +548,32 @@ def _row_of(it):
 
 
 def ingest():
-    """增量拉取 MosDNS 日志：只拉比上次更新的，避免漏采和重复"""
+    """增量拉取 MosDNS 日志
+
+    ⚠️ MosDNS 的 /logs 接口**没有** after/since 参数，所以仍然要拉全量
+       500 条再在本地过滤 —— 省的不是带宽，而是无谓的 INSERT。
+       过滤用 last_log_id 做「已处理水位线」：
+         遇到它就把后面的丢掉（它是上一轮处理过的最新一条）。
+       如果它已经滑出窗口（高流量时会被挤掉），就整批当作新数据处理，
+       靠 INSERT OR IGNORE 去重 —— 不会写重复，只是这一轮做无用功。
+    """
     c = db()
-    # 读取上次采集的最新日志 ID
     with _db_lock:
         row = c.execute("SELECT v FROM meta WHERE k='last_log_id'").fetchone()
     last_id = row[0] if row else ""
 
-    # 构建请求：如果有上次 ID，尝试增量拉取
-    if last_id:
-        # MosDNS API 可能不支持 after 参数，仍拉全量但用 last_id 过滤
-        out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
-                       % (STATS_API, LOG_PAGE), 25)
-    else:
-        out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
-                       % (STATS_API, LOG_PAGE), 25)
-
+    out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
+                   % (STATS_API, LOG_PAGE), 25)
     j = _jload(out)
     items = (j or {}).get("items") or []
     if not items:
         return 0, err
 
-    # 如果有 last_id，只处理比它新的（ID 更大或时间更新）
     if last_id:
         new_items = []
         for it in items:
             if it.get("id") == last_id:
-                break  # 遇到旧数据，停止
+                break
             new_items.append(it)
         items = new_items
 
@@ -567,9 +585,12 @@ def ingest():
         c.executemany("INSERT OR IGNORE INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         c.execute("DELETE FROM logs WHERE id NOT IN "
                   "(SELECT id FROM logs ORDER BY ts DESC, id DESC LIMIT ?)", (LOG_KEEP,))
-        # 更新最新 ID
-        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_log_id',?)",
-                  (items[0].get("id") or "",))
+        # 水位线只往前推：万一这轮拿到的批次比已记录的还旧（窗口回绕），
+        # 不要把 last_log_id 改回去，否则下一轮会重复处理同一批。
+        new_top = items[0].get("id") or ""
+        if new_top and new_top != last_id:
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_log_id',?)",
+                      (new_top,))
         c.commit()
     return len(rows), err
 
@@ -1998,7 +2019,11 @@ class Handler(BaseHTTPRequestHandler):
         if not cfg:
             return False
         p = (urlparse(self.path).path.rstrip("/")) or "/"
-        if p in ("/login.html", "/api/login") or p.startswith("/static/login"):
+        # 探针与指标不需要登录态：k8s/Docker 探针带不了 cookie，
+        # 若被拦成 401，健康检查就永远失败（等于没有）。
+        # /metrics 只暴露聚合数字、不含客户端身份，可以放行。
+        if (p in ("/login.html", "/api/login", "/healthz", "/metrics")
+                or p.startswith("/static/login")):
             return False
         if self._sess_user():
             return False
@@ -2397,80 +2422,106 @@ class Handler(BaseHTTPRequestHandler):
                                                   ensure_ascii=False))
 
         if p == "/healthz":
-            """Kubernetes/Docker 健康检查：快速返回各组件状态"""
+            """健康/就绪探针：返回各组件状态
+
+            🔴 判定分两层，不能混为一谈：
+               - required：数据库、磁盘 —— 挂了服务就真的不可用
+               - optional：AGH、iKuai —— 这两个是**可选**集成，
+                 没配 agh.conf / iKuai.conf 的部署本来就不该有它们。
+                 旧实现把 optional 也算进 all()，导致只装 MosDNS 的
+                 正常部署永远返回 503，探针形同虚设。
+            """
             checks = {}
-            # SSH 检查
-            try:
-                out, err = ssh("echo OK", 3)
-                checks["ssh"] = err is None and "OK" in (out or "")
-            except:
-                checks["ssh"] = False
-            # 数据库检查
+            # --- 必需：数据库 ---
             try:
                 c = db()
                 with _db_lock:
                     c.execute("SELECT 1").fetchone()
                 checks["database"] = True
-            except:
+            except Exception:
                 checks["database"] = False
-            # MosDNS API 检查
-            try:
-                out, err = ssh('curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
-                checks["mosdns"] = err is None and out and len(out) > 10
-            except:
-                checks["mosdns"] = False
-            # 磁盘空间检查
+            # --- 必需：磁盘 ---
             try:
                 import shutil
-                stat = shutil.disk_usage(HERE)
-                checks["disk"] = stat.free > 100 * 1024 * 1024  # >100MB
-            except:
+                checks["disk"] = shutil.disk_usage(HERE).free > 100 * 1024 * 1024
+            except Exception:
                 checks["disk"] = False
-            # AGH 检查
-            checks["agh"] = bool(_agh.get("ok"))
-            # iKuai 检查
-            checks["ikuai"] = bool(_ik.get("ok"))
+            # --- 数据链路：SSH + MosDNS（不可用时服务降级但不崩溃）---
+            try:
+                out, err = ssh("echo OK", 3)
+                checks["ssh"] = err is None and "OK" in (out or "")
+            except Exception:
+                checks["ssh"] = False
+            try:
+                out, err = ssh('curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
+                checks["mosdns"] = bool(err is None and out and len(out) > 10)
+            except Exception:
+                checks["mosdns"] = False
+            # --- 可选集成：没配就是 None（未启用），配了但连不上才是 False ---
+            # ⚠️ 判据必须是「配置文件是否存在」，不能用 conf 里的 URL 是否为空：
+            #    ik_conf() 硬编码了默认 IKUAI_URL=https://192.168.1.1，
+            #    没配 ikuai.conf 时它照样返回一个 URL，会把「未启用」误判成「连不上」。
+            checks["agh"] = (None if not os.path.exists(AGH_CONF)
+                             else bool(_agh.get("ok")))
+            checks["ikuai"] = (None if not os.path.exists(IK_CONF)
+                              else bool(_ik.get("ok")))
 
-            ok = all(checks.values())
-            return self._send(200 if ok else 503, json.dumps({
-                "status": "ok" if ok else "error",
+            required_ok = checks["database"] and checks["disk"]
+            data_ok = checks["ssh"] and checks["mosdns"]
+            optional_bad = any(v is False for v in checks.values())
+
+            # 就绪：服务本身可用（DB + 磁盘）；数据链路断开时仍算 live 但不算 ready
+            code = 200 if required_ok else 503
+            status = "ok" if (required_ok and data_ok and not optional_bad) else (
+                "degraded" if required_ok else "error")
+            return self._send(code, json.dumps({
+                "status": status,
+                "ready": bool(required_ok),
                 "checks": checks,
                 "uptime_s": int(time.time() - START_TS),
             }, ensure_ascii=False))
 
         if p == "/metrics":
-            """Prometheus metrics 端点：供 Grafana/Prometheus 采集"""
+            """Prometheus 指标端点：供 Grafana/Prometheus 采集
+
+            ⚠️ 这里**必须**用缓存快照，不能 force=True：
+               Prometheus 默认 15~30s 抓一次，而 collect() 会发起 4 次 SSH。
+               强制采集等于把路由器的 SSH 负载翻一倍，且抓取耗时长时会堆积。
+               后台 push_loop 已有 2s 一轮的采集，缓存足够新鲜。"""
             try:
-                data = get_snapshot(force=True)
+                data = get_snapshot()
                 s = data.get("stats") or {}
-                metrics = []
-                # 基础指标
-                metrics.append("# HELP mosdns_queries_total Total DNS queries")
-                metrics.append("# TYPE mosdns_queries_total counter")
-                metrics.append("mosdns_queries_total %s" % (s.get("total_queries") or 0))
-                metrics.append("# HELP mosdns_cache_hits_total Total cache hits")
-                metrics.append("# TYPE mosdns_cache_hits_total counter")
-                metrics.append("mosdns_cache_hits_total %s" % (s.get("cached_queries") or 0))
-                metrics.append("# HELP mosdns_blocked_total Total blocked queries")
-                metrics.append("# TYPE mosdns_blocked_total counter")
-                metrics.append("mosdns_blocked_total %s" % (s.get("blocked_queries") or 0))
-                metrics.append("# HELP mosdns_uptime_seconds Uptime in seconds")
-                metrics.append("# TYPE mosdns_uptime_seconds gauge")
-                metrics.append("mosdns_uptime_seconds %d" % int(time.time() - START_TS))
-                # 上游指标
-                ups = data.get("upstreams") or {}
-                for r in (ups.get("rows") or []):
-                    addr = r.get("addr") or ""
-                    metrics.append("# HELP mosdns_upstream_queries_total Upstream queries")
-                    metrics.append("# TYPE mosdns_upstream_queries_total counter")
-                    metrics.append('mosdns_upstream_queries_total{upstream="%s"} %s'
-                                   % (addr, r.get("c") or 0))
+                out = []
+                out.append("# HELP mosdns_queries_total Total DNS queries")
+                out.append("# TYPE mosdns_queries_total counter")
+                out.append("mosdns_queries_total %s" % (s.get("total_queries") or 0))
+                out.append("# HELP mosdns_cache_hits_total Total cache hits")
+                out.append("# TYPE mosdns_cache_hits_total counter")
+                out.append("mosdns_cache_hits_total %s" % (s.get("cached_queries") or 0))
+                out.append("# HELP mosdns_blocked_total Total blocked queries")
+                out.append("# TYPE mosdns_blocked_total counter")
+                out.append("mosdns_blocked_total %s" % (s.get("blocked_queries") or 0))
+                out.append("# HELP mosdns_cache_size Current cache entries")
+                out.append("# TYPE mosdns_cache_size gauge")
+                out.append("mosdns_cache_size %s" % (data.get("cache_size") or 0))
+                out.append("# HELP mosdns_uptime_seconds Uptime in seconds")
+                out.append("# TYPE mosdns_uptime_seconds gauge")
+                out.append("mosdns_uptime_seconds %d" % int(time.time() - START_TS))
+                out.append("# HELP mosdns_upstream_queries_total Upstream queries")
+                out.append("# TYPE mosdns_upstream_queries_total counter")
+                out.append("# HELP mosdns_upstream_latency_ms Upstream average latency")
+                out.append("# TYPE mosdns_upstream_latency_ms gauge")
+                # HELP/TYPE 每个指标族只出一次；标签值要转义，
+                # 否则 upstream 里带引号/反斜杠会破坏 exposition 格式。
+                for r in ((data.get("upstreams") or {}).get("rows") or []):
+                    label = _prom_label(r.get("addr") or "")
+                    out.append("mosdns_upstream_queries_total{upstream=\"%s\"} %s"
+                               % (label, r.get("c") or 0))
                     if r.get("ms") is not None:
-                        metrics.append("# HELP mosdns_upstream_latency_ms Upstream latency")
-                        metrics.append("# TYPE mosdns_upstream_latency_ms gauge")
-                        metrics.append('mosdns_upstream_latency_ms{upstream="%s"} %.2f'
-                                       % (addr, r.get("ms")))
-                return self._send(200, "\n".join(metrics), "text/plain; version=0.0.4")
+                        out.append("mosdns_upstream_latency_ms{upstream=\"%s\"} %.2f"
+                                   % (label, r.get("ms")))
+                return self._send(200, "\n".join(out) + "\n",
+                                  "text/plain; version=0.0.4")
             except Exception as e:
                 return self._send(500, "# ERROR: %s\n" % e, "text/plain")
 
@@ -2587,12 +2638,17 @@ class MuxHTTPServer(ThreadingHTTPServer):
             except Exception:
                 self._close(sock)
                 raise
-        # 明文：换成能挂标记的子类（detach 把 fd 交给它，原对象不再拥有这个 fd）
+        # 明文连接：换成能挂标记的子类（detach 把 fd 交给它，原对象不再拥有这个 fd）
         try:
             # 先取再 detach —— detach 之后原对象的 family/type/proto 不保证还能读
             fam, typ, pro = sock.family, sock.type, sock.proto
             plain = _PlainSocket(fam, typ, pro, fileno=sock.detach())
-            plain.plain_http = True
+            # 🔴 只有真的启用了 TLS 才标记成"待重定向"。
+            #    没配证书时 ssl_ctx is None，此时服务就是明文 HTTP，
+            #    若仍打标记，_redirect_plain_http 会 301 跳到 https:// ——
+            #    而服务器根本不会 TLS，浏览器只会拿到无限重定向 /
+            #    ERR_TOO_MANY_REDIRECTS，整个面板变得不可访问。
+            plain.plain_http = self.ssl_ctx is not None
             return plain, addr
         except Exception:
             return sock, addr
