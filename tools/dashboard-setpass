@@ -4,9 +4,16 @@
 # 直接跑会交互式提示输入新密码（不回显），特殊字符不会被 shell 吃掉。
 set -euo pipefail
 
-DIR=/opt/mosdns-dashboard
+# 安装目录：优先用环境变量，否则取脚本所在目录的上级（即项目根）
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+DIR=${MOSDNS_DASH_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}
 CONF="$DIR/auth.conf"
-PY=/usr/bin/python3
+# Python 解释器：允许覆盖，找不到 python3 时退回 python
+if [ -n "${MOSDNS_PYTHON:-}" ]; then
+  PY="$MOSDNS_PYTHON"
+else
+  PY=$(command -v python3 || command -v python || echo /usr/bin/python3)
+fi
 
 [ -w "$DIR" ] || { echo "需要 root 权限（$DIR 不可写）" >&2; exit 1; }
 

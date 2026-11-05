@@ -88,25 +88,37 @@
 
 ## 安装
 
+**方式 A：MosDNS 与面板同机（推荐，最省资源）**
+
 ```bash
-# 1. 放代码
 git clone <你的仓库地址> /opt/mosdns-dashboard
 cd /opt/mosdns-dashboard
 
-# 2. 建配置（四个 .example 复制过去即可，AGH / iKuai / devices 不配也能跑）
+cp auth.conf.example auth.conf && chmod 600 auth.conf
+./tools/dashboard-setpass
+
+# 不需要 SSH key —— 直接读本机的 MosDNS 配置
+MOSDNS_TRANSPORT=local ./server.py
+```
+
+**方式 B：面板在另一台机器，通过 SSH 取数（现有方式）**
+
+```bash
+git clone <你的仓库地址> /opt/mosdns-dashboard
+cd /opt/mosdns-dashboard
+
 cp auth.conf.example    auth.conf    && chmod 600 auth.conf
 cp agh.conf.example     agh.conf     && chmod 600 agh.conf      # 可选
 cp ikuai.conf.example   ikuai.conf   && chmod 600 ikuai.conf    # 可选
 cp devices.conf.example devices.conf                            # 可选
 
-# 3. 设登录密码（会写入 auth.conf 的 AUTH_HASH / AUTH_SECRET）
 ./tools/dashboard-setpass
 
-# 4. SSH key（面板要用它连路由器）
-ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519_mosdns -N ''
-ssh-copy-id -i /root/.ssh/id_ed25519_mosdns root@<路由器IP>
+# SSH key（面板要用它连路由器）
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_mosdns -N ''
+ssh-copy-id -i ~/.ssh/id_ed25519_mosdns root@<路由器IP>
 
-# 5. 装服务
+# 装服务
 cp deploy/mosdns-dashboard.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now mosdns-dashboard
@@ -124,15 +136,42 @@ systemctl enable --now mosdns-dashboard
 |---|---|---|
 | `DASH_HOST` | `0.0.0.0` | 监听地址 |
 | `DASH_PORT` | `8088` | 监听端口 |
-| `DASH_TLS_CERT` | `/opt/mosdns-dashboard/ssl/server.pem` | TLS 证书链 |
-| `DASH_TLS_KEY` | `/opt/mosdns-dashboard/ssl/server.key` | TLS 私钥 |
-| `MOSDNS_HOST` | `192.168.1.1` | 路由器 IP |
-| `MOSDNS_USER` | `root` | SSH 用户名 |
-| `MOSDNS_SSH_KEY` | `/root/.ssh/id_ed25519_mosdns` | SSH 私钥路径 |
+| `DASH_TLS_CERT` | `<安装目录>/ssl/server.pem` | TLS 证书链 |
+| `DASH_TLS_KEY` | `<安装目录>/ssl/server.key` | TLS 私钥 |
+| `MOSDNS_TRANSPORT` | `auto` | 取数方式：`auto` / `local` / `ssh` |
+| `MOSDNS_HOST` | `192.168.1.1` | 路由器 IP（ssh 模式） |
+| `MOSDNS_USER` | `root` | SSH 用户名（ssh 模式） |
+| `MOSDNS_SSH_PORT` | `22` | SSH 端口（ssh 模式） |
+| `MOSDNS_SSH_KEY` | `~/.ssh/id_ed25519_mosdns` | SSH 私钥路径（ssh 模式） |
+| `MOSDNS_API_ADDR` | `127.0.0.1:9091` | MosDNS API 地址 |
+| `MOSDNS_API_PATH` | `/plugins/stats_collector/api/v1` | MosDNS API 路径 |
+| `MOSDNS_PORT` | `5335` | MosDNS DNS 端口（实时查询用） |
+| `MOSDNS_CFG_PATH` | 自动探测 | MosDNS 配置文件路径 |
+| `LAN_IFACE` | 自动探测 | 局域网接口名（取 MAC 用） |
 | `INGEST_INTERVAL` | `5` | 采集间隔（秒） |
 | `PUSH_INTERVAL` | `2` | 有人在看时的 SSE 采样间隔（秒） |
 | `PUSH_IDLE_INTERVAL` | `10` | 没人看时的采样间隔（秒） |
 | `UP_CFG_TTL` | `60` | 上游清单配置缓存（秒） |
+
+### 取数方式（MOSDNS_TRANSPORT）
+
+| 值 | 适用场景 |
+|---|---|
+| `auto` | 本机有 MosDNS 配置文件就直接读，否则走 SSH（默认，兼容老部署） |
+| `local` | MosDNS 与面板同机、Docker 部署 —— 不需要 SSH，纯 Python 读配置 |
+| `ssh` | 面板在另一台机器，通过 SSH 到路由器取数（现有行为） |
+
+`local` 模式下**不依赖** `ssh` / `curl` / `dig` / `base64`，只需要 Python 标准库。
+
+### 自动探测的内容
+
+不再需要手工指定的东西：
+
+- **MosDNS 配置文件**：按 `/var/etc/mosdns.json` → `/etc/mosdns.json` → `/etc/mosdns/mosdns.json` → `/usr/local/etc/mosdns.json` → `<安装目录>/mosdns.json` 顺序找
+- **局域网接口**：默认路由所在接口 → 候选列表（`br-lan` / `br0` / `eth0` / `eth1` / `ens18` / `ens19` / `enp1s0`）里邻居最多的
+- **MAC 地址来源**：`ip neigh`（自动接口 → 不限接口）→ `/proc/net/arp` → `arp -a`（Windows/macOS）
+- **邻居表格式**：BusyBox（`IP lladdr MAC`）和 iproute2（`IP dev X lladdr MAC`）都能解析
+- **Python 解释器**：ssh 模式下按 `python3` → `python` → `python3.12` → `python3.11` → `python3.10` 逐个尝试
 
 建议写进 systemd drop-in（模板见 `deploy/mosdns-dashboard.service` 末尾注释）。
 

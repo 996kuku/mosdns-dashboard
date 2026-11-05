@@ -473,6 +473,135 @@ def test_guard_allows_probes():
         return False
 
 
+def test_adaptive_transport():
+    """测试 10：传输方式自适应与路径外部化"""
+    print("=" * 60)
+    print("测试 10：自适应传输与路径外部化")
+    print("=" * 60)
+
+    try:
+        # 路径不再写死 /opt
+        for name in ("TLS_CERT", "TLS_KEY", "SSH_KEY"):
+            v = getattr(server, name)
+            assert "/opt/" not in v, f"{name} 仍写死 /opt: {v}"
+        print(f"  TLS_CERT = {server.TLS_CERT}")
+        print(f"  SSH_KEY  = {server.SSH_KEY}")
+        print("  ✓ 路径以 HERE/HOME 为基准")
+
+        # 传输模式可强制指定
+        orig = server._transport_cache["mode"]
+        server._transport_cache["mode"] = None
+        server.TRANSPORT = "local"
+        assert server.transport_mode() == "local"
+        print("  ✓ local 模式生效")
+        server.TRANSPORT = "ssh"
+        server._transport_cache["mode"] = None
+        assert server.transport_mode() == "ssh"
+        print("  ✓ ssh 模式生效")
+        server._transport_cache["mode"] = orig
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_neigh_parser_both_formats():
+    """测试 11：邻居表解析兼容 BusyBox 与 iproute2"""
+    print("=" * 60)
+    print("测试 11：邻居表解析双格式兼容")
+    print("=" * 60)
+
+    try:
+        busybox = ("192.168.1.40 lladdr 8c:d0:b2:b0:36:c4 STALE\n"
+                   "192.168.1.41 lladdr aa:bb:cc:dd:ee:ff REACHABLE")
+        iproute2 = ("192.168.1.50 dev br-lan lladdr 11:22:33:44:55:66 STALE\n"
+                    "default dev br-lan")
+        a = server._parse_neigh_lines(busybox)
+        b = server._parse_neigh_lines(iproute2)
+        print(f"  BusyBox 格式: {a}")
+        print(f"  iproute2 格式: {b}")
+        assert len(a) == 2, f"BusyBox 应解析出 2 条，实际 {len(a)}"
+        assert len(b) == 1, f"iproute2 应解析出 1 条，实际 {len(b)}"
+        assert a["192.168.1.40"] == "8c:d0:b2:b0:36:c4"
+        assert b["192.168.1.50"] == "11:22:33:44:55:66"
+        print("  ✓ 两种格式都能正确解析\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_dns_query_without_dig():
+    """测试 12：原生 DNS 查询可用（不依赖 dig）"""
+    print("=" * 60)
+    print("测试 12：原生 DNS 查询")
+    print("=" * 60)
+
+    try:
+        # 编码/解码自洽
+        enc = server._dns_encode_name("example.com")
+        assert enc == b"\x07example\x03com\x00", f"编码错误: {enc!r}"
+        dec, off = server._dns_decode_name(enc, 0)
+        assert dec == "example.com", f"解码错误: {dec}"
+        print(f"  编解码自洽: {dec}")
+
+        # 真实查询（公共 DNS）
+        r = server._dns_query("223.5.5.5", 53, "example.com", 1, timeout=4)
+        print(f"  example.com A -> {r}")
+        assert r and r[0][0] == "A", "DNS 查询失败"
+        print("  ✓ 不依赖 dig 即可完成查询\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_no_hardcoded_br_lan():
+    """测试 13：不再写死 br-lan"""
+    print("=" * 60)
+    print("测试 13：网接口不再写死 br-lan")
+    print("=" * 60)
+
+    try:
+        import inspect
+        src = inspect.getsource(server)
+        # read_macs 里不该再有写死 br-lan 的调用
+        assert 'ip neigh show dev br-lan' not in src, "仍有写死 br-lan 的调用"
+        assert 'dev %s' in src or "dev \"" in src, "未使用动态接口"
+        # 必须有候选列表与探测函数
+        assert hasattr(server, "detect_lan_iface")
+        assert server.LAN_IFACE_CANDIDATES, "候选接口列表为空"
+        print(f"  候选接口: {', '.join(server.LAN_IFACE_CANDIDATES[:5])}")
+        print(f"  探测函数: detect_lan_iface()")
+        print("  ✓ 接口改为自动探测 + 可配置\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_mosdns_cfg_not_hardcoded():
+    """测试 14：MosDNS 配置路径改为候选探测"""
+    print("=" * 60)
+    print("测试 14：MosDNS 配置路径自适应")
+    print("=" * 60)
+
+    try:
+        import inspect
+        src = inspect.getsource(server)
+        # 远端脚本里不该再写死单一路径
+        assert 'open("/var/etc/mosdns.json")' not in src, "远端脚本仍写死单一路径"
+        assert server.MOSDNS_CFG_CANDIDATES, "候选路径为空"
+        print(f"  候选路径 {len(server.MOSDNS_CFG_CANDIDATES)} 个:")
+        for p in server.MOSDNS_CFG_CANDIDATES[:5]:
+            print(f"    - {p}")
+        print("  ✓ 改为多候选自动探测\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
 def main():
     print("\n" + "=" * 60)
     print("MosDNS Dashboard 冒烟测试")
@@ -490,6 +619,11 @@ def main():
     results.append(("metrics 格式与缓存", test_metrics_format_and_caching()))
     results.append(("采集并发串行化", test_collect_lock_serializes()))
     results.append(("探针端点免认证", test_guard_allows_probes()))
+    results.append(("自适应传输与路径", test_adaptive_transport()))
+    results.append(("邻居表双格式解析", test_neigh_parser_both_formats()))
+    results.append(("原生 DNS 查询", test_dns_query_without_dig()))
+    results.append(("网接口不写死", test_no_hardcoded_br_lan()))
+    results.append(("配置路径自适应", test_mosdns_cfg_not_hardcoded()))
 
     # 汇总结果
     print("=" * 60)

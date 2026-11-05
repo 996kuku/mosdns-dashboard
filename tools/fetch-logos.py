@@ -49,7 +49,9 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
-HERE = "/opt/mosdns-dashboard"
+HERE = os.environ.get(
+    "MOSDNS_DASH_DIR",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB = os.path.join(HERE, "logs.db")
 OUT = os.path.join(HERE, "static", "logo")
 DEFAULT_PROXY = "http://127.0.0.1:20171"

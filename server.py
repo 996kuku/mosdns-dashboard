@@ -21,9 +21,11 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import socket
 import ssl
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -32,16 +34,56 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
+# ---------- 路径基准（配置区要用，必须最先定义）----------
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME_DIR = os.path.expanduser("~") or os.environ.get("HOME", ".")
+
 # ---------- 配置 ----------
+# 所有默认值都可用环境变量覆盖；路径类默认值以 HERE 为基准，
+# 这样换成 /app（Docker）、~/mosdns-dashboard（用户目录）都不用改代码。
 LISTEN_HOST = os.environ.get("DASH_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("DASH_PORT", "8088"))
-TLS_CERT = os.environ.get("DASH_TLS_CERT", "/opt/mosdns-dashboard/ssl/server.pem")
-TLS_KEY  = os.environ.get("DASH_TLS_KEY",  "/opt/mosdns-dashboard/ssl/server.key")
+TLS_CERT = os.environ.get("DASH_TLS_CERT", os.path.join(HERE, "ssl", "server.pem"))
+TLS_KEY  = os.environ.get("DASH_TLS_KEY",  os.path.join(HERE, "ssl", "server.key"))
+
+# ---- 传输方式 ----
+# auto   ：配置文件在本机就直接读，否则走 SSH（默认，兼容老部署）
+# local  ：强制本机执行（MosDNS 与面板同机 / Docker 部署）
+# ssh    ：强制 SSH（现有行为）
+TRANSPORT = os.environ.get("MOSDNS_TRANSPORT", "auto").strip().lower()
 MOSDNS_HOST = os.environ.get("MOSDNS_HOST", "192.168.1.1")
 MOSDNS_USER = os.environ.get("MOSDNS_USER", "root")
-SSH_KEY = os.environ.get("MOSDNS_SSH_KEY", "/root/.ssh/id_ed25519_mosdns")
-STATS_API = "http://127.0.0.1:9091/plugins/stats_collector/api/v1"
-MOSDNS_PORT = 5335
+SSH_KEY = os.environ.get("MOSDNS_SSH_KEY", os.path.join(HOME_DIR, ".ssh", "id_ed25519_mosdns"))
+SSH_PORT = int(os.environ.get("MOSDNS_SSH_PORT", "22"))
+SSH_OPTS = [x for x in os.environ.get("MOSDNS_SSH_OPTS", "").split() if x]
+
+# ---- MosDNS ----
+# API 地址与插件路径分开：换了 MosDNS 版本只改路径，换了端口只改地址
+MOSDNS_API_ADDR = os.environ.get("MOSDNS_API_ADDR", "127.0.0.1:9091")
+MOSDNS_API_PATH = os.environ.get("MOSDNS_API_PATH",
+                                 "/plugins/stats_collector/api/v1")
+STATS_API = "http://%s%s" % (MOSDNS_API_ADDR, MOSDNS_API_PATH)
+MOSDNS_PORT = int(os.environ.get("MOSDNS_PORT", "5335"))
+# 配置文件位置：写死路径在不同部署下必然踩坑，改成候选列表自动探测
+MOSDNS_CFG_PATH = os.environ.get("MOSDNS_CFG_PATH", "")
+MOSDNS_CFG_CANDIDATES = [
+    MOSDNS_CFG_PATH,
+    "/var/etc/mosdns.json",
+    "/etc/mosdns.json",
+    "/etc/mosdns/mosdns.json",
+    "/usr/local/etc/mosdns.json",
+    os.path.join(HERE, "mosdns.json"),
+]
+MOSDNS_CFG_CANDIDATES = [p for p in MOSDNS_CFG_CANDIDATES if p]
+# 远端执行脚本用的解释器候选（精简系统可能只装了 python 或 python3.11）
+MOSDNS_PY_CANDS = [x for x in os.environ.get(
+    "MOSDNS_PY_CANDS", "python3,python,python3.12,python3.11,python3.10").split(",") if x]
+
+# ---- 局域网接口 ----
+# 写死 br-lan 在 x86 软路由 / VLAN / 爱快主路由上都会拿不到 MAC
+LAN_IFACE = os.environ.get("LAN_IFACE", "")
+LAN_IFACE_CANDIDATES = [x for x in os.environ.get(
+    "LAN_IFACE_CANDIDATES", "br-lan,br0,eth0,eth1,ens18,ens19,enp1s0").split(",") if x]
 CACHE_TTL = 10           # 快照缓存秒数（普通 /api/snapshot 用；SSE 不走这个缓存）
 # ---- 实时推送（SSE）----
 # PUSH_INTERVAL 是"有人在看面板"时的采集间隔；没人看时降到 PUSH_IDLE_INTERVAL，
@@ -69,7 +111,6 @@ TOP_SHOW = 50            # 页面榜单展示条数（热门 / 拦截都是 50�
 TOP_FETCH = 150          # 向 MosDNS 拉取的条数；多拉一些，基线差分过滤掉后仍够 50 条
 AGH_PAGE = 500           # 单次从 AGH querylog 拉取的条数（它没有 500 的硬上限，但没必要太多）
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX = os.path.join(HERE, "index.html")
 STATIC_DIR = os.path.join(HERE, "static")
 SEP = "@@@MOSDNS-SPLIT@@@"
@@ -101,14 +142,43 @@ _sse_lock = threading.Lock()
 _last_sig = {"v": None}
 
 
-# ---------- SSH ----------
-def ssh(cmd, timeout=25):
+# ---------- 传输层 ----------
+# 面板取数有两种落点：MosDNS 在本机，或者在远端路由器上。
+# 以前只有 SSH 一条路 —— 本机部署、Docker、没有 OpenSSH 的环境
+# （比如 Windows）全都用不了。这里统一成 run_cmd()，按 TRANSPORT 分派。
+_transport_cache = {"mode": None}
+
+
+def _local_cmd(cmd, timeout):
+    """在本机直接执行命令（MosDNS 与面板同机时用）
+
+    ⚠️ 传 list 时不走 shell，避免 Windows 的 cmd.exe 与 POSIX 引号规则打架
+       （shlex.quote 生成单引号，cmd.exe 不认，会把引号当成路径的一部分）。
+       传 str 时才走 shell —— 那种情况下命令里的重定向/管道是必需的。
+    """
+    try:
+        if isinstance(cmd, (list, tuple)):
+            p = subprocess.run(list(cmd), capture_output=True, timeout=timeout)
+        else:
+            p = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "local command timeout"
+    except Exception as e:
+        return None, str(e)
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip()[:300]
+        return None, err or ("exit %d" % p.returncode)
+    return p.stdout.decode("utf-8", "replace"), None
+
+
+def _ssh_cmd(cmd, timeout):
     full = ["ssh", "-i", SSH_KEY,
+            "-p", str(SSH_PORT),
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
-            "-o", "LogLevel=ERROR",
-            "%s@%s" % (MOSDNS_USER, MOSDNS_HOST), cmd]
+            "-o", "LogLevel=ERROR"] + SSH_OPTS + \
+           ["%s@%s" % (MOSDNS_USER, MOSDNS_HOST), cmd]
     try:
         p = subprocess.run(full, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -118,6 +188,63 @@ def ssh(cmd, timeout=25):
     if p.returncode != 0:
         return None, p.stderr.decode("utf-8", "replace").strip()[:300]
     return p.stdout.decode("utf-8", "replace"), None
+
+
+def _resolve_transport():
+    """决定用哪种传输方式。结果缓存，启动后不再变。
+
+    auto 的判定顺序：
+      1. 本机存在 MosDNS 配置文件 → local（同机部署最省资源）
+      2. 存在 SSH 私钥 → ssh（兼容所有老部署，行为不变）
+      3. 都没有 → 仍然返回 ssh，让后续调用去报错，
+         错误信息里会提示怎么配（避免静默变成 local 而后拿不到数据）
+    """
+    mode = TRANSPORT
+    if mode not in ("auto", "local", "ssh"):
+        sys.stderr.write("[transport] 未知 MOSDNS_TRANSPORT=%r，回退 auto\n" % mode)
+        mode = "auto"
+    if mode == "auto":
+        if any(os.path.exists(p) for p in MOSDNS_CFG_CANDIDATES):
+            mode = "local"
+        else:
+            mode = "ssh"
+    return mode
+
+
+def transport_mode():
+    if _transport_cache["mode"] is None:
+        _transport_cache["mode"] = _resolve_transport()
+    return _transport_cache["mode"]
+
+
+def run_cmd(cmd, timeout=25):
+    """在 MosDNS 所在机器上执行命令，返回 (stdout, err)
+
+    这是取数的**唯一**入口 —— 所有采集函数都走它，
+    这样换部署环境只需要改 MOSDNS_TRANSPORT，不用动业务代码。
+    """
+    if transport_mode() == "local":
+        return _local_cmd(cmd, timeout)
+    return _ssh_cmd(cmd, timeout)
+
+
+def ssh(cmd, timeout=25):
+    """向后兼容的别名：老代码里的 ssh() 调用都指向它。
+
+    ⚠️ 注意：它走的是**按配置决定**的传输方式，不一定是真的 SSH。
+        healthz 里要单独检查"SSH 是否真的可用"，得直接调 _ssh_cmd。
+    """
+    return run_cmd(cmd, timeout)
+
+
+def ssh_available():
+    """SSH 那条路本身是否可用（给健康检查用，不触发自动降级）"""
+    if not os.path.exists(SSH_KEY):
+        return False, "SSH key 不存在: %s" % SSH_KEY
+    out, err = _ssh_cmd("echo OK", 5)
+    if err:
+        return False, err
+    return ("OK" in (out or "")), ""
 
 
 def _jload(txt):
@@ -146,16 +273,24 @@ _up_lock = threading.Lock()
 # 用 base64 传输是为了绕开 ssh -> sh -> python 三层的引号转义地狱。
 # ⚠️ 这个脚本只 open(..., "r") 读配置，不做任何写操作 / 不改路由器的任何状态。
 _UP_CFG_PY = """
-import json, socket
+import json, socket, sys
 def is_ip(s):
     try:
         socket.inet_aton(s); return True
     except Exception:
         return ":" in s
-try:
-    j = json.load(open("/var/etc/mosdns.json"))
-except Exception as e:
-    print(json.dumps({"error": str(e)})); raise SystemExit
+paths = sys.argv[1:]
+j = None
+for p in paths:
+    try:
+        j = json.load(open(p)); break
+    except FileNotFoundError:
+        continue
+    except Exception as e:
+        print(json.dumps({"error": "%s: %s" % (p, e)})); raise SystemExit
+if j is None:
+    print(json.dumps({"error": "no mosdns config found in %s" % paths}))
+    raise SystemExit
 fwd = []
 for p in j.get("plugins", []):
     if p.get("type") != "forward":
@@ -198,8 +333,33 @@ def read_upstream_cfg(force=False):
         if (not force and _up_cfg["data"] is not None
                 and (now - _up_cfg["ts"]) < UP_CFG_TTL):
             return _up_cfg["data"], _up_cfg["err"]
-    b64 = base64.b64encode(_UP_CFG_PY.encode("utf-8")).decode("ascii")
-    out, err = ssh('echo "%s" | base64 -d | python3' % b64, 25)
+    # 配置路径作为 argv 传给 python（脚本内 sys.argv[1:]），
+    # 逐个候选尝试，路径里即使有空格/引号也安全（shlex.quote）。
+    args = " ".join(shlex.quote(p) for p in MOSDNS_CFG_CANDIDATES)
+    if transport_mode() == "local":
+        # 本机执行：写临时脚本，用参数列表直接跑，完全绕开 shell
+        # （Windows 的 cmd.exe 不认 POSIX 引号，走 shell 必踩坑）
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".py", prefix="mdash_up_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(_UP_CFG_PY)
+            out, err = run_cmd([sys.executable, tmp] + MOSDNS_CFG_CANDIDATES, 25)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    else:
+        # SSH 到 Linux：解释器做候选，精简系统可能只有 python / python3.11
+        b64 = base64.b64encode(_UP_CFG_PY.encode("utf-8")).decode("ascii")
+        py_list = " ".join(MOSDNS_PY_CANDS)
+        cmd = ('for P in %s; do '
+               '  command -v $P >/dev/null 2>&1 || continue; '
+               '  OUT=$(echo "%s" | base64 -d | $P - %s 2>/dev/null); '
+               '  if [ -n "$OUT" ]; then echo "$OUT"; break; fi; '
+               'done') % (py_list, b64, args)
+        out, err = run_cmd(cmd, 25)
     data = _jload(out)
     if not (data and isinstance(data.get("forward"), list)):
         # 取不到就退回上一次的缓存（有总比没有好），把错误如实带出去给前端提示。
@@ -424,7 +584,7 @@ def _collect():
            'curl -s --noproxy "*" -m 10 "http://127.0.0.1:9091/metrics" '
            '| grep mosdns_cache_size_current'
            % (STATS_API, SEP, STATS_API, TOP_FETCH, SEP, STATS_API, SEP))
-    out, err = ssh(cmd, 30)
+    out, err = run_cmd(cmd, 30)
     if err:
         errors.append("ssh: %s" % err)
 
@@ -562,7 +722,7 @@ def ingest():
         row = c.execute("SELECT v FROM meta WHERE k='last_log_id'").fetchone()
     last_id = row[0] if row else ""
 
-    out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
+    out, err = run_cmd('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
                    % (STATS_API, LOG_PAGE), 25)
     j = _jload(out)
     items = (j or {}).get("items") or []
@@ -1390,18 +1550,115 @@ def agh_clients():
     return agh_get("/control/stats_top?limit=100")
 
 
-def read_macs():
-    """从路由器的邻居表取 IP→MAC（只读命令，不动任何配置）
-    注意 BusyBox 的 ip neigh 输出格式是：
-      192.168.1.40 lladdr 8c:d0:b2:b0:36:c4 STALE
-    中间夹着 "lladdr"，所以 MAC 在**第 3 列**，不是第 5 列。
-    在 Python 侧解析，不用 awk（省一层 shell 转义麻烦）。"""
-    out, _ = ssh("ip neigh show dev br-lan 2>/dev/null", 15)
+_iface_cache = {"name": "", "ts": 0.0}
+
+
+def detect_lan_iface():
+    """探测局域网接口名
+
+    写死 br-lan 的坑：x86 软路由、VLAN 划分、爱快做主路由、
+    无线网卡当 LAN 口 —— 这些场景下都不叫 br-lan，直接导致 MAC 全空。
+
+    判定顺序：
+      1. LAN_IFACE 显式指定（最高优先）
+      2. 默认路由所在的接口（最可靠：能出网的口就是 LAN 口）
+      3. 候选列表里挑邻居数最多的
+    """
+    if LAN_IFACE:
+        return LAN_IFACE
+    now = time.time()
+    if _iface_cache["name"] and now - _iface_cache["ts"] < 300:
+        return _iface_cache["name"]
+
+    name = ""
+    # 2. 默认路由所在接口
+    out, _ = run_cmd("ip route show default 2>/dev/null", 10)
+    for line in (out or "").splitlines():
+        if " dev " in line:
+            name = line.split(" dev ", 1)[1].split()[0]
+            break
+    # 3. 候选里挑邻居最多的
+    if not name:
+        best, best_n = "", -1
+        for cand in LAN_IFACE_CANDIDATES:
+            o, _ = run_cmd("ip neigh show dev %s 2>/dev/null" % shlex.quote(cand), 10)
+            n = len([x for x in (o or "").splitlines() if x.strip()])
+            if n > best_n:
+                best, best_n = cand, n
+        name = best
+
+    if name:
+        _iface_cache["name"] = name
+        _iface_cache["ts"] = now
+    return name
+
+
+def _parse_neigh_lines(out):
+    """解析 `ip neigh` 输出 → {ip: mac}
+
+    两种格式都要吃：
+      iproute2 : 192.168.1.40 dev br-lan lladdr 8c:d0:b2:b0:36:c4 STALE
+      BusyBox   : 192.168.1.40 lladdr 8c:d0:b2:b0:36:c4 STALE
+    BusyBox 的输出里没有 "dev"，MAC 在第 3 列而不是第 5 列 ——
+    早先只按第 5 列解析，在 BusyBox 上会全空。
+    """
     macs = {}
     for line in (out or "").splitlines():
         p = line.split()
-        if len(p) >= 3 and p[1] == "lladdr" and ":" in p[2]:
-            macs[p[0]] = p[2].lower()
+        if "lladdr" in p:
+            i = p.index("lladdr")
+            if i + 1 < len(p) and ":" in p[i + 1]:
+                macs[p[0]] = p[i + 1].lower()
+    return macs
+
+
+def _read_arp_proc():
+    """Linux 下兜底：直接读 /proc/net/arp（不依赖 ip 命令）"""
+    macs = {}
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8", errors="replace") as f:
+            next(f, None)  # 表头
+            for line in f:
+                p = line.split()
+                if len(p) >= 4 and ":" in p[3] and p[3] != "00:00:00:00:00:00":
+                    macs[p[0]] = p[3].lower()
+    except Exception:
+        pass
+    return macs
+
+
+def read_macs():
+    """取 IP→MAC 映射（只读，不动任何配置）
+
+    多来源依次尝试，任一成功即用：
+      1. ip neigh show dev <自动探测的接口>
+      2. ip neigh show（不限接口，滤掉 IPv6 链路本地）
+      3. /proc/net/arp（没有 ip 命令时）
+      4. arp -a（Windows / macOS 本地部署）
+    """
+    # 1. 指定/探测到的接口
+    iface = detect_lan_iface()
+    if iface:
+        out, _ = run_cmd("ip neigh show dev %s 2>/dev/null" % shlex.quote(iface), 15)
+        macs = _parse_neigh_lines(out)
+        if macs:
+            return macs
+    # 2. 不限接口
+    out, _ = run_cmd("ip neigh show 2>/dev/null", 15)
+    macs = _parse_neigh_lines(out)
+    if macs:
+        return macs
+    # 3. /proc/net/arp
+    macs = _read_arp_proc()
+    if macs:
+        return macs
+    # 4. arp -a（本地部署在 Windows/macOS 上时）
+    out, _ = run_cmd("arp -a 2>/dev/null", 10)
+    macs = {}
+    for line in (out or "").splitlines():
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{11,17})", line)
+        if m:
+            macs[m.group(1)] = m.group(2).lower().replace("-", ":")
     return macs
 
 
@@ -1700,29 +1957,124 @@ def get_snapshot(force=False):
 
 
 # ---------- 实时查询 ----------
+def _dns_encode_name(name):
+    """把域名编码成 DNS 报文里的 label 序列"""
+    out = b""
+    for label in name.rstrip(".").split("."):
+        if label:
+            out += bytes([len(label)]) + label.encode("utf-8")
+    return out + b"\x00"
+
+
+def _dns_skip_name(data, off):
+    """跳过报文中可能带压缩指针的域名，返回新的偏移"""
+    while off < len(data):
+        n = data[off]
+        if n == 0:
+            return off + 1
+        if n & 0xC0 == 0xC0:          # 压缩指针：14 位偏移
+            return off + 2
+        off += 1 + n
+    return off
+
+
+def _dns_decode_name(data, off):
+    """解出域名（处理压缩指针）"""
+    parts, jumped, seen = [], False, 0
+    pos = off
+    while seen < 64:                    # 防指针环
+        seen += 1
+        if pos >= len(data):
+            break
+        n = data[pos]
+        if n == 0:
+            pos += 1
+            if not jumped:
+                off = pos
+            break
+        if n & 0xC0 == 0xC0:
+            ptr = ((n & 0x3F) << 8) | data[pos + 1]
+            if not jumped:
+                off = pos + 2
+            jumped = True
+            pos = ptr
+            continue
+        parts.append(data[pos + 1:pos + 1 + n].decode("utf-8", "replace"))
+        pos += 1 + n
+    return ".".join(parts), off
+
+
+def _dns_query(host, port, name, qtype, timeout=3.0):
+    """用 UDP 直接发一条 DNS 查询，返回 [(类型, 值), ...]
+
+    为什么不用 dig：精简系统（OpenWrt / Alpine / 多数 Docker 镜像）
+    默认不带 dig，而这是面板唯一需要的 DNS 客户端能力。
+    用标准库手写一个最小实现，就少一个外部依赖。
+    """
+    try:
+        tid = secrets.randbelow(65536)
+        header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        q = header + _dns_encode_name(name) + struct.pack(">HH", qtype, 1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(q, (host, port))
+            data, _ = s.recvfrom(4096)
+        if len(data) < 12:
+            return []
+        ancount = struct.unpack(">H", data[6:8])[0]
+        off = _dns_skip_name(data, 12)
+        off += 4                                # 跳过 question 的 type/class
+        out = []
+        for _ in range(ancount):
+            _nm, off = _dns_decode_name(data, off)
+            if off + 10 > len(data):
+                break
+            rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if off + rdlen > len(data):
+                break
+            if rtype == 1 and rdlen == 4:                       # A
+                out.append(("A", socket.inet_ntoa(data[off:off + 4])))
+            elif rtype == 28 and rdlen == 16:                   # AAAA
+                out.append(("AAAA", socket.inet_ntop(socket.AF_INET6,
+                                               data[off:off + 16])))
+            elif rtype == 5:                                    # CNAME
+                val, _ = _dns_decode_name(data, off)
+                out.append(("CNAME", val.rstrip(".")))
+            off += rdlen
+        return out
+    except Exception:
+        return []
+
+
 def query(name):
     t0 = time.time()
-    nm = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())[:路由器]
+    nm = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())[:253]
     if not nm:
         return {"ok": False, "error": "名称为空或不合法"}
 
-    dig = ('dig @127.0.0.1 -p %d +noall +answer +time=3 +tries=1 %s A; '
-           'dig @127.0.0.1 -p %d +noall +answer +time=3 +tries=1 %s AAAA'
-           % (MOSDNS_PORT, nm, MOSDNS_PORT, nm))
-    out, err = ssh(dig, 25)
-
+    # 优先用 Python 原生查询（不依赖 dig）；全空时回退到 dig
     answers, seen = [], set()
-    for line in (out or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith(";"):
-            continue
-        p = line.split()
-        if len(p) >= 5 and p[3] in ("A", "AAAA", "CNAME"):
-            v = p[4].rstrip(".")
-            k = (p[3], v)
-            if k not in seen:
-                seen.add(k)
-                answers.append({"type": p[3], "value": v})
+    host = "127.0.0.1" if transport_mode() == "local" else MOSDNS_HOST
+    for qtype, code in (("A", 1), ("AAAA", 28)):
+        for t, v in _dns_query(host, MOSDNS_PORT, nm, qtype):
+            if (t, v) not in seen:
+                seen.add((t, v))
+                answers.append({"type": t, "value": v})
+
+    if not answers and transport_mode() != "local":
+        # 远端兜底：有些环境 MosDNS 只监听特定地址，本机直连不通
+        dig = ('dig @%s -p %d +noall +answer +time=3 +tries=1 %s A; '
+               'dig @%s -p %d +noall +answer +time=3 +tries=1 %s AAAA'
+               % (MOSDNS_HOST, MOSDNS_PORT, nm, MOSDNS_HOST, MOSDNS_PORT, nm))
+        out, _ = run_cmd(dig, 25)
+        for line in (out or "").splitlines():
+            p = line.strip().split()
+            if len(p) >= 5 and p[3] in ("A", "AAAA", "CNAME"):
+                v = p[4].rstrip(".")
+                if (p[3], v) not in seen:
+                    seen.add((p[3], v))
+                    answers.append({"type": p[3], "value": v})
 
     # 从 MosDNS 日志里找这次查询的处理链路（A / AAAA 分别取最新一条）
     handling = {}
@@ -1749,14 +2101,14 @@ def query(name):
         "answers": answers,
         "mosdns": handling.get("A") or handling.get("AAAA"),
         "handling": handling,
-        "via": "%s:%d" % (MOSDNS_HOST, MOSDNS_PORT),
+        "via": "%s:%d" % (host, MOSDNS_PORT),
+        "transport": transport_mode(),
         "took_ms": int((time.time() - t0) * 1000),
-        "error": err,
     }
 
 
 def _jload_pull_logs():
-    out, _ = ssh('curl -s --noproxy "*" -m 10 "%s/logs"' % STATS_API, 20)
+    out, _ = run_cmd('curl -s --noproxy "*" -m 10 "%s/logs"' % STATS_API, 20)
     j = _jload(out)
     return (j or {}).get("items") or []
 
@@ -2446,14 +2798,20 @@ class Handler(BaseHTTPRequestHandler):
                 checks["disk"] = shutil.disk_usage(HERE).free > 100 * 1024 * 1024
             except Exception:
                 checks["disk"] = False
-            # --- 数据链路：SSH + MosDNS（不可用时服务降级但不崩溃）---
+            # --- 数据链路：取数通道 + MosDNS（不可用时服务降级但不崩溃）---
+            # ⚠️ 判定要跟着 TRANSPORT 走：local 模式下没有 SSH，
+            #    判 "ssh": false 会让健康检查永远 degraded。
+            mode = transport_mode()
+            if mode == "local":
+                checks["transport"] = "local"
+                checks["ssh"] = None      # 该模式不用 SSH，不参与判定
+            else:
+                ok_ssh, _why = ssh_available()
+                checks["transport"] = "ssh"
+                checks["ssh"] = ok_ssh
             try:
-                out, err = ssh("echo OK", 3)
-                checks["ssh"] = err is None and "OK" in (out or "")
-            except Exception:
-                checks["ssh"] = False
-            try:
-                out, err = ssh('curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
+                out, err = run_cmd(
+                    'curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
                 checks["mosdns"] = bool(err is None and out and len(out) > 10)
             except Exception:
                 checks["mosdns"] = False
@@ -2467,7 +2825,9 @@ class Handler(BaseHTTPRequestHandler):
                               else bool(_ik.get("ok")))
 
             required_ok = checks["database"] and checks["disk"]
-            data_ok = checks["ssh"] and checks["mosdns"]
+            # ssh 为 None 表示当前模式不用 SSH（local），不参与判定
+            ssh_ok = checks["ssh"] is not False
+            data_ok = ssh_ok and checks["mosdns"]
             optional_bad = any(v is False for v in checks.values())
 
             # 就绪：服务本身可用（DB + 磁盘）；数据链路断开时仍算 live 但不算 ready
@@ -2675,14 +3035,27 @@ def main():
         else:
             sys.stderr.write("⚠️  未启用认证，仅监听 %s\n" % LISTEN_HOST)
 
-    # 检查 SSH 连接
-    try:
-        out, err = ssh("echo OK", 5)
-        if err or "OK" not in (out or ""):
-            sys.stderr.write("⚠️  SSH 连接失败: %s\n" % (err or "无法连接"))
-            sys.stderr.write("   请检查 MOSDNS_HOST、MOSDNS_SSH_KEY 配置\n")
-    except Exception as e:
-        sys.stderr.write("⚠️  SSH 检查异常: %s\n" % e)
+    # 检查取数通道
+    mode = transport_mode()
+    sys.stderr.write("取数方式: %s" % mode)
+    if mode == "local":
+        found = next((p for p in MOSDNS_CFG_CANDIDATES if os.path.exists(p)), "")
+        if found:
+            sys.stderr.write("（MosDNS 配置: %s）\n" % found)
+        else:
+            sys.stderr.write("  ⚠️ 未找到 MosDNS 配置文件，候选: %s\n"
+                             % ", ".join(MOSDNS_CFG_CANDIDATES))
+    else:
+        sys.stderr.write("（%s@%s:%d，key %s）\n"
+                         % (MOSDNS_USER, MOSDNS_HOST, SSH_PORT, SSH_KEY))
+        try:
+            ok, why = ssh_available()
+            if not ok:
+                sys.stderr.write("⚠️  SSH 连接失败: %s\n" % why)
+                sys.stderr.write("   请检查 MOSDNS_HOST / MOSDNS_SSH_PORT / "
+                                 "MOSDNS_SSH_KEY，或改用 MOSDNS_TRANSPORT=local\n")
+        except Exception as e:
+            sys.stderr.write("⚠️  SSH 检查异常: %s\n" % e)
 
     # 检查数据库
     try:
