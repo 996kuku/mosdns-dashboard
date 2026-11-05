@@ -163,6 +163,42 @@ systemctl enable --now mosdns-dashboard
 
 `local` 模式下**不依赖** `ssh` / `curl` / `dig` / `base64`，只需要 Python 标准库。
 
+### 设备数据源（可插拔）
+
+设备名 / MAC 的来源不止爱快一种。面板按优先级依次启用所有可用的数据源：
+
+| 顺序 | provider | 数据来源 | 需要配置 |
+|---|---|---|---|
+| 1 | `arp` | ARP / 邻居表（自动探测接口） | 无，总是可用 |
+| 2 | `dnsmasq` | dnsmasq 租约文件 | 无，OpenWrt 白送 |
+| 3 | `agh` | AdGuard Home 客户端列表 | `agh.conf` |
+| 4 | `ikuai` | 爱快 DHCP 租约表 | `ikuai.conf` |
+| 5 | `http` | 任意返回 JSON 的接口 | `DEV_HTTP_URL` |
+| 6 | `manual` | `devices.conf` 手写映射 | `devices.conf` |
+
+**后者覆盖前者**，所以 `manual` 的优先级最高。
+
+`DEVICE_PROVIDERS` 控制启用哪些：
+
+```bash
+# auto：启用所有探测到的（默认）
+DEVICE_PROVIDERS=auto
+
+# 只用指定的，顺序即优先级
+DEVICE_PROVIDERS=dnsmasq,agh,manual
+```
+
+**通用 HTTP provider** 支持两种返回格式：
+
+```json
+[{"ip": "192.168.1.10", "name": "我的电脑"}]
+```
+```json
+{"192.168.1.10": "我的电脑"}
+```
+
+自检：`curl http://localhost:8088/api/providers` 可以看到每个源拿到多少数据。
+
 ### 自动探测的内容
 
 不再需要手工指定的东西：

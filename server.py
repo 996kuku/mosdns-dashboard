@@ -79,6 +79,15 @@ MOSDNS_CFG_CANDIDATES = [p for p in MOSDNS_CFG_CANDIDATES if p]
 MOSDNS_PY_CANDS = [x for x in os.environ.get(
     "MOSDNS_PY_CANDS", "python3,python,python3.12,python3.11,python3.10").split(",") if x]
 
+# ---- 设备数据源 ----
+# auto：启用所有探测到的 provider（默认）
+# 逗号分隔：只用指定的，顺序即优先级（后者覆盖前者）
+DEVICE_PROVIDERS = os.environ.get("DEVICE_PROVIDERS", "auto").strip()
+# 通用 HTTP provider：任意能返回 JSON 的接口都能当设备名来源
+DEV_HTTP_URL = os.environ.get("DEV_HTTP_URL", "")
+# 返回结构支持两种：数组 [{ip,name}] 或对象 {ip: name}
+DEV_HTTP_TIMEOUT = int(os.environ.get("DEV_HTTP_TIMEOUT", "8"))
+
 # ---- 局域网接口 ----
 # 写死 br-lan 在 x86 软路由 / VLAN / 爱快主路由上都会拿不到 MAC
 LAN_IFACE = os.environ.get("LAN_IFACE", "")
@@ -825,8 +834,17 @@ _mac_cache = {"ts": 0.0, "map": {}}
 
 
 def macs_now():
+    """IP → MAC。走多数据源：dnsmasq 租约文件也带 MAC，
+    比 ARP 表更全（ARP 只保留最近通信过的设备）。"""
     if time.time() - _mac_cache["ts"] > 60:
-        _mac_cache["map"] = read_macs()
+        merged = {}
+        try:
+            merged.update(device_providers()["macs"])
+        except Exception:
+            pass
+        if not merged:                      # provider 全挂时退回纯 ARP
+            merged = read_macs()
+        _mac_cache["map"] = merged
         _mac_cache["ts"] = time.time()
     return _mac_cache["map"]
 
@@ -857,18 +875,22 @@ def read_alogs(n=LOG_DEFAULT):
 
 
 def read_client_top(limit=30):
-    """按客户端统计查询量（从 alogs 现算，不依赖 AGH 的统计接口）"""
+    """按客户端统计查询量（从 alogs 现算，不依赖 AGH 的统计接口）
+
+    设备信息走多数据源合并（provider 体系），
+    设备名优先级：手动 devices.conf > HTTP > 爱快 > AGH > dnsmasq
+    """
     conn = db()
     with _db_lock:
         rows = conn.execute(
             "SELECT client, COUNT(*) c, SUM(blocked) b FROM alogs "
             "GROUP BY client ORDER BY c DESC LIMIT ?", (int(limit),)).fetchall()
-    dev = dev_names()
-    macs = macs_now()
-    hosts = _ik.get("host") or {}
+    info = device_providers()
+    dev, macs, hosts = info["names"], info["macs"], info["hosts"]
     return [{"ip": r[0], "mac": macs.get(r[0], ""), "c": int(r[1] or 0),
              "b": int(r[2] or 0), "name": dev.get(r[0], ""),
-             "host": hosts.get(r[0], "")} for r in rows]
+             "host": hosts.get(r[0], ""),
+             "sources": info.get("sources") or []} for r in rows]
 
 
 def _norm_log_ts(ts):
@@ -1272,6 +1294,194 @@ def load_devices():
     return dev
 
 
+# ---------- 设备数据源（可插拔）----------
+# 设备名/MAC 的来源不止爱快一种：dnsmasq 的租约文件、AGH 客户端列表、
+# ARP 表、任意 HTTP 接口都可以。这里做成 provider 注册表，
+# 按优先级依次取、依次合并，谁先谁后**低优先级不覆盖高优先级**。
+#
+# 每个 provider 是一个函数，返回 {"names": {ip: name}, "macs": {...}, "hosts": {...}}，
+# 取不到数据就返回 None（失败）或 {}（无数据），异常由调用方吞掉。
+_PROVIDER_TTL = 60          # 各 provider 结果缓存秒数
+_provider_cache = {}        # name -> {"ts": float, "data": dict}
+
+
+def _provider_result(name, fn):
+    """跑一个 provider 并缓存结果；失败返回 None"""
+    now = time.time()
+    c = _provider_cache.get(name)
+    if c and now - c["ts"] < _PROVIDER_TTL:
+        return c["data"]
+    try:
+        data = fn() or {}
+    except Exception as e:
+        sys.stderr.write("[provider:%s] 失败: %s\n" % (name, e))
+        data = None
+    if data is not None:
+        # 字段补齐，避免调用方判空
+        data.setdefault("names", {})
+        data.setdefault("macs", {})
+        data.setdefault("hosts", {})
+        _provider_cache[name] = {"ts": now, "data": data}
+    return data
+
+
+def _p_manual():
+    """devices.conf：手动配置，优先级最高"""
+    return {"names": load_devices(), "macs": {}, "hosts": {}}
+
+
+def _p_arp():
+    """ARP / 邻居表：只要能连上网的机器都有，兜底最可靠"""
+    return {"names": {}, "macs": read_macs(), "hosts": {}}
+
+
+def _p_dnsmasq():
+    """dnsmasq 租约文件：OpenWrt 上 dnsmasq 是默认 DHCP，白送的数据源
+
+    格式：<expire> <mac> <ip> <hostname> <client-id>
+    hostname 为 * 时表示客户端没上报名字。
+    """
+    paths = [os.environ.get("DNSMASQ_LEASES", ""),
+             "/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases",
+             "/var/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"]
+    names, macs = {}, {}
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    p2 = line.split()
+                    if len(p2) < 4:
+                        continue
+                    mac, ip, host = p2[1].lower(), p2[2], p2[3]
+                    if ":" in mac:
+                        macs[ip] = mac
+                    if host and host != "*":
+                        names[ip] = host
+            break
+        except Exception:
+            continue
+    return {"names": names, "macs": macs, "hosts": names}
+
+
+def _p_agh():
+    """AdGuard Home 客户端列表（已依赖 AGH 的部署白送）"""
+    if not os.path.exists(AGH_CONF):
+        return None
+    j = agh_get("/control/clients")
+    clients = (j or {}).get("clients") or []
+    names = {}
+    for c in clients:
+        nm = (c.get("name") or "").strip()
+        for a in (c.get("ids") or []):
+            if a and nm:
+                names[a] = nm
+    return {"names": names, "macs": {}, "hosts": {}}
+
+
+def _p_ikuai():
+    """爱快 DHCP 租约表（现有的 iKuai 实现）"""
+    if not os.path.exists(IK_CONF):
+        return None
+    n = ik_names()
+    if not n:
+        return None
+    return {"names": n, "macs": {}, "hosts": _ik.get("host") or {}}
+
+
+def _p_http():
+    """通用 HTTP provider：任意返回 JSON 的接口都能当设备名来源
+
+    支持两种返回：
+      [{"ip": "1.2.3.4", "name": "abc"}, ...]
+      {"1.2.3.4": "abc", ...}
+    """
+    if not DEV_HTTP_URL:
+        return None
+    import urllib.request
+    req = urllib.request.Request(DEV_HTTP_URL, headers={
+        "User-Agent": "mosdns-dashboard",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=DEV_HTTP_TIMEOUT) as r:
+        j = json.loads(r.read().decode("utf-8", "replace") or "null")
+    names = {}
+    if isinstance(j, dict):
+        for k, v in j.items():
+            if isinstance(v, str) and v:
+                names[k] = v
+            elif isinstance(v, dict):
+                nm = (v.get("name") or v.get("hostname") or "").strip()
+                ip = v.get("ip") or k
+                if ip and nm:
+                    names[ip] = nm
+    elif isinstance(j, list):
+        for it in j:
+            if not isinstance(it, dict):
+                continue
+            ip = (it.get("ip") or it.get("client") or "").strip()
+            nm = (it.get("name") or it.get("hostname") or "").strip()
+            if ip and nm:
+                names[ip] = nm
+    return {"names": names, "macs": {}, "hosts": {}}
+
+
+# provider 注册表：顺序即优先级（**后注册的覆盖先注册的**）
+# 所以把手动配置放最后（最高优先），ARP 放最前（最低优先）。
+DEVICE_PROVIDER_FUNCS = [
+    ("arp", _p_arp),
+    ("dnsmasq", _p_dnsmasq),
+    ("agh", _p_agh),
+    ("ikuai", _p_ikuai),
+    ("http", _p_http),
+    ("manual", _p_manual),
+]
+
+
+def _resolve_providers():
+    """算出实际要用的 provider 列表"""
+    if DEVICE_PROVIDERS.lower() == "auto":
+        return list(DEVICE_PROVIDER_FUNCS)
+    want = [x.strip().lower() for x in DEVICE_PROVIDERS.split(",") if x.strip()]
+    known = {n for n, _ in DEVICE_PROVIDER_FUNCS}
+    unknown = [x for x in want if x not in known]
+    if unknown:
+        sys.stderr.write("[providers] 未知 provider: %s（可用: %s）\n"
+                         % (", ".join(unknown), ", ".join(sorted(known))))
+    # 显式指定时按用户给的顺序（先给的优先级低，后给的高）
+    return [(n, f) for n, f in DEVICE_PROVIDER_FUNCS if n in want]
+
+
+def device_providers():
+    """采集所有可用 provider 的设备信息，按优先级合并
+
+    合并规则：低优先级先写，高优先级后写并覆盖 ——
+    所以 manual 在最后，它的结果最权威。
+    """
+    merged = {"names": {}, "macs": {}, "hosts": {}}
+    used = []
+    for name, fn in _resolve_providers():
+        d = _provider_result(name, fn)
+        if not d:
+            continue
+        used.append(name)
+        for k in ("names", "macs", "hosts"):
+            merged[k].update(d.get(k) or {})
+    merged["sources"] = used
+    return merged
+
+
+def dev_names():
+    """设备名（多数据源合并后的结果）"""
+    return device_providers()["names"]
+
+
+def dev_macs():
+    """设备 MAC（多数据源合并后的结果）"""
+    return device_providers()["macs"]
+
+
 # ---------- 爱快（iKuai）----------
 # 爱快的 Web 管理界面本身就是一套 JSON API：
 #   POST /Action/login  {"username","passwd"(md5),"pass"(base64)} -> sess_key
@@ -1457,17 +1667,6 @@ def ik_names(force=False):
         _ik["host"] = host
         _ik["names_ts"] = time.time()
     return _ik["names"]
-
-
-def dev_names():
-    """设备名优先级：手动 devices.conf > 爱快 DHCP hostname"""
-    names = {}
-    try:
-        names.update(ik_names())
-    except Exception:
-        pass
-    names.update(load_devices())
-    return names
 
 
 def agh_login(force=False):
@@ -2696,6 +2895,31 @@ class Handler(BaseHTTPRequestHandler):
                      "clients": read_client_top(30),
                      "agh_ok": bool(_agh.get("ok")), "agh_err": _agh.get("err") or ""},
                     ensure_ascii=False))
+            except Exception as e:
+                return self._send(500, json.dumps({"ok": False, "error": str(e)},
+                                                  ensure_ascii=False))
+
+        if p == "/api/providers":
+            """设备数据源自检：哪些 provider 启用了、各自拿到多少数据"""
+            try:
+                info = device_providers()
+                detail = []
+                for name, _fn in _resolve_providers():
+                    d = _provider_result(name, _fn) or {}
+                    detail.append({
+                        "name": name,
+                        "names": len(d.get("names") or {}),
+                        "macs": len(d.get("macs") or {}),
+                    })
+                return self._send(200, json.dumps({
+                    "ok": True,
+                    "config": DEVICE_PROVIDERS,
+                    "active": info.get("sources") or [],
+                    "providers": detail,
+                    "total": {"names": len(info["names"]),
+                              "macs": len(info["macs"]),
+                              "hosts": len(info["hosts"])},
+                }, ensure_ascii=False))
             except Exception as e:
                 return self._send(500, json.dumps({"ok": False, "error": str(e)},
                                                   ensure_ascii=False))

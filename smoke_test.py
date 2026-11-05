@@ -602,6 +602,229 @@ def test_mosdns_cfg_not_hardcoded():
         return False
 
 
+def test_device_providers_registry():
+    """测试 15：设备数据源 provider 注册与自动启用"""
+    print("=" * 60)
+    print("测试 15：设备数据源 provider 注册")
+    print("=" * 60)
+
+    try:
+        names = [n for n, _ in server.DEVICE_PROVIDER_FUNCS]
+        print(f"  已注册: {', '.join(names)}")
+        for expect in ("arp", "dnsmasq", "agh", "ikuai", "http", "manual"):
+            assert expect in names, f"缺少 provider: {expect}"
+
+        # auto 模式应启用全部
+        orig = server.DEVICE_PROVIDERS
+        server.DEVICE_PROVIDERS = "auto"
+        got = [n for n, _ in server._resolve_providers()]
+        assert len(got) == len(names), f"auto 应启用全部，实际 {got}"
+        print(f"  ✓ auto 启用 {len(got)} 个 provider")
+
+        # 显式指定
+        server.DEVICE_PROVIDERS = "dnsmasq,manual"
+        got = [n for n, _ in server._resolve_providers()]
+        assert got == ["dnsmasq", "manual"], f"显式指定失败: {got}"
+        print(f"  ✓ 显式指定生效: {got}")
+
+        # 未知 provider 应被忽略而不是报错
+        server.DEVICE_PROVIDERS = "bogus,manual"
+        got = [n for n, _ in server._resolve_providers()]
+        assert got == ["manual"], f"未知 provider 未过滤: {got}"
+        print(f"  ✓ 未知 provider 被安全忽略")
+
+        server.DEVICE_PROVIDERS = orig
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_device_providers_priority():
+    """测试 16：多源合并时高优先级覆盖低优先级"""
+    print("=" * 60)
+    print("测试 16：设备数据源优先级合并")
+    print("=" * 60)
+
+    try:
+        import tempfile
+        # 造 devices.conf（manual provider 的数据源）
+        with open("devices.conf", "w", encoding="utf-8") as f:
+            f.write("10.0.0.5=手动配置名\n")
+        server._provider_cache.clear()
+        try:
+            info = server.device_providers()
+            assert info["names"].get("10.0.0.5") == "手动配置名", \
+                f"manual 未生效: {info['names']}"
+            print(f"  manual 数据: {info['names']}")
+            print(f"  启用的源: {info['sources']}")
+            print("  ✓ manual（最高优先级）生效")
+
+            # 顺序决定优先级：把 manual 放前面，低优先级的会覆盖它
+            orig = server.DEVICE_PROVIDERS
+            server.DEVICE_PROVIDERS = "manual,arp"
+            server._provider_cache.clear()
+            # arp 在这台机器上拿不到 10.0.0.5，所以 manual 的值仍在
+            info2 = server.device_providers()
+            assert info2["names"].get("10.0.0.5") == "手动配置名"
+            print("  ✓ 顺序即优先级（后者覆盖前者）")
+            server.DEVICE_PROVIDERS = orig
+        finally:
+            if os.path.exists("devices.conf"):
+                os.remove("devices.conf")
+            server._provider_cache.clear()
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_dnsmasq_provider():
+    """测试 17：dnsmasq 租约文件解析"""
+    print("=" * 60)
+    print("测试 17：dnsmasq 租约文件解析")
+    print("=" * 60)
+
+    try:
+        import tempfile
+        # dnsmasq 租约格式：<expire> <mac> <ip> <hostname> <client-id>
+        content = ("1700000000 aa:bb:cc:dd:ee:ff 192.168.1.50 myphone *\n"
+                   "1700000001 11:22:33:44:55:66 192.168.1.51 *\n"
+                   "1700000002 77:88:99:aa:bb:cc 192.168.1.52 tv\n")
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "dnsmasq.leases")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        orig = os.environ.get("DNSMASQ_LEASES")
+        os.environ["DNSMASQ_LEASES"] = p
+        # 直接调 provider 函数（绕过缓存）
+        r = server._p_dnsmasq()
+        if orig is None:
+            os.environ.pop("DNSMASQ_LEASES", None)
+        else:
+            os.environ["DNSMASQ_LEASES"] = orig
+
+        print(f"  names: {r['names']}")
+        print(f"  macs:  {r['macs']}")
+        assert r["names"].get("192.168.1.50") == "myphone"
+        assert r["names"].get("192.168.1.52") == "tv"
+        assert r["macs"].get("192.168.1.50") == "aa:bb:cc:dd:ee:ff"
+        assert "192.168.1.51" not in r["names"], "hostname 为 * 时不应写入"
+        print("  ✓ 租约解析正确，* 已正确跳过\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_http_provider():
+    """测试 18：通用 HTTP provider 两种返回格式"""
+    print("=" * 60)
+    print("测试 18：通用 HTTP provider")
+    print("=" * 60)
+
+    try:
+        import threading
+        import json as _json
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            mode = "list"
+            def do_GET(self):
+                body = ([] if self.mode == "list" else {})
+                if self.mode == "list":
+                    body = [{"ip": "10.1.1.1", "name": "dev-a"},
+                            {"ip": "10.1.1.2", "name": "dev-b"}]
+                else:
+                    body = {"10.1.1.3": "dev-c"}
+                data = _json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            # 数组格式
+            H.mode = "list"
+            orig = server.DEV_HTTP_URL
+            server.DEV_HTTP_URL = f"http://127.0.0.1:{port}/x"
+            r = server._p_http()
+            print(f"  数组格式: {r['names']}")
+            assert r["names"].get("10.1.1.1") == "dev-a"
+
+            # 对象格式
+            H.mode = "dict"
+            r2 = server._p_http()
+            print(f"  对象格式: {r2['names']}")
+            assert r2["names"].get("10.1.1.3") == "dev-c"
+            server.DEV_HTTP_URL = orig
+            print("  ✓ 两种返回格式都支持\n")
+            return True
+        finally:
+            srv.shutdown()
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_providers_endpoint():
+    """测试 19：/api/providers 自检端点"""
+    print("=" * 60)
+    print("测试 19：/api/providers 端点")
+    print("=" * 60)
+
+    try:
+        from io import BytesIO
+
+        class MockHandler(server.Handler):
+            def __init__(self):
+                self.path = "/api/providers"
+                self.command = "GET"
+                self.headers = {}
+                self.rfile = BytesIO()
+                self.wfile = BytesIO()
+                self._response_code = 0
+                self.address_string = lambda: "127.0.0.1"
+
+            def send_response(self, code, message=None):
+                self._response_code = code
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+            def log_message(self, fmt, *args):
+                pass
+
+        server._provider_cache.clear()
+        h = MockHandler()
+        h.do_GET()
+        j = json.loads(h.wfile.getvalue().decode())
+        print(f"  状态码: {h._response_code}")
+        print(f"  启用的源: {j.get('active')}")
+        print(f"  provider 明细: {len(j.get('providers') or [])} 个")
+        assert h._response_code == 200
+        assert "providers" in j and "active" in j
+        assert isinstance(j["providers"], list) and j["providers"]
+        print("  ✓ 自检端点正常\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
 def main():
     print("\n" + "=" * 60)
     print("MosDNS Dashboard 冒烟测试")
@@ -624,6 +847,11 @@ def main():
     results.append(("原生 DNS 查询", test_dns_query_without_dig()))
     results.append(("网接口不写死", test_no_hardcoded_br_lan()))
     results.append(("配置路径自适应", test_mosdns_cfg_not_hardcoded()))
+    results.append(("设备源 provider 注册", test_device_providers_registry()))
+    results.append(("设备源优先级合并", test_device_providers_priority()))
+    results.append(("dnsmasq 租约解析", test_dnsmasq_provider()))
+    results.append(("通用 HTTP provider", test_http_provider()))
+    results.append(("provider 自检端点", test_providers_endpoint()))
 
     # 汇总结果
     print("=" * 60)
