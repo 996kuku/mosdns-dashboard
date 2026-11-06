@@ -122,7 +122,6 @@ AGH_PAGE = 500           # 单次从 AGH querylog 拉取的条数（它没有 50
 
 INDEX = os.path.join(HERE, "index.html")
 STATIC_DIR = os.path.join(HERE, "static")
-SEP = "@@@MOSDNS-SPLIT@@@"
 AGH_CONF = os.path.join(HERE, "agh.conf")
 # 设备名映射（可选）：一行一条 "192.168.1.200=我的台式机"，放在 devices.conf 里
 DEV_CONF = os.path.join(HERE, "devices.conf")
@@ -237,13 +236,102 @@ def run_cmd(cmd, timeout=25):
     return _ssh_cmd(cmd, timeout)
 
 
-def ssh(cmd, timeout=25):
-    """向后兼容的别名：老代码里的 ssh() 调用都指向它。
+# ---- 传输感知的 HTTP 客户端 ----
+# 以前所有 HTTP 请求都靠 shell 里的 curl。curl 在精简系统
+# （Alpine、OpenWrt 精简镜像、多数 Docker 镜像）里默认不带，
+# 而且要拼一串引号转义。这里改成：
+#   local 模式 → urllib（标准库，零依赖）
+#   ssh 模式   → 仍然用 curl（远端机器上通常有）
+#
+# AGH 和爱快都用自签证书，所以默认不做证书校验 ——
+# 反正只从内网访问，换取「不依赖任何外部工具」是值得的。
+_SSL_RELAXED = os.environ.get("DASH_STRICT_TLS", "0") != "1"
 
-    ⚠️ 注意：它走的是**按配置决定**的传输方式，不一定是真的 SSH。
-        healthz 里要单独检查"SSH 是否真的可用"，得直接调 _ssh_cmd。
-    """
-    return run_cmd(cmd, timeout)
+
+def _ssl_ctx_relaxed():
+    if not _SSL_RELAXED:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def http_get(url, timeout=10, headers=None):
+    """GET 一个 URL，返回 (状态码, body)；失败返回 (None, 错误说明)"""
+    if transport_mode() == "local":
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_ssl_ctx_relaxed()) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception as e:
+            return None, str(e)
+    cmd = 'curl -s --noproxy "*" -m %d -w "\\n@@@HTTP%%{http_code}" "%s"' % (
+        int(timeout), url)
+    if headers:
+        for k, v in headers.items():
+            cmd += ' -H "%s: %s"' % (k, v)
+    out, err = run_cmd(cmd, timeout)
+    if err:
+        return None, err
+    body, _, code = (out or "").rpartition("@@@HTTP")
+    try:
+        return int(code.strip() or 0), body
+    except Exception:
+        return None, "无法解析响应"
+
+
+def http_post_json(url, payload, timeout=10):
+    """POST JSON，返回 (状态码, body, 响应头 dict)"""
+    body_in = json.dumps(payload, ensure_ascii=False)
+    if transport_mode() == "local":
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=body_in.encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_ssl_ctx_relaxed()) as r:
+                hdrs = {k: v for k, v in r.headers.items()}
+                return r.status, r.read().decode("utf-8", "replace"), hdrs
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace"), {}
+        except Exception as e:
+            return None, str(e), {}
+    # ssh 模式：用临时文件存响应头，避开 shell 引号地狱
+    import tempfile
+    hdrs_path = tempfile.mktemp(prefix="mdash_h_")
+    cmd = ('curl -sk --noproxy "*" -m %d -X POST "%s" '
+           '-H "Content-Type: application/json" '
+           '-D %s -o %s -d %s; echo "@@@HTTP%%{http_code}"; '
+           'cat %s 2>/dev/null; rm -f %s %s'
+           % (int(timeout), url, shlex.quote(hdrs_path), shlex.quote(hdrs_path + ".b"),
+              shlex.quote(body_in), shlex.quote(hdrs_path),
+              shlex.quote(hdrs_path), shlex.quote(hdrs_path + ".b")))
+    out, err = run_cmd(cmd, timeout)
+    if err:
+        return None, err, {}
+    raw_body, _, tail = (out or "").rpartition("@@@HTTP")
+    code_s, _, raw_hdrs = tail.partition("\n")
+    body = ""
+    try:
+        with open(hdrs_path + ".b", "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    except Exception:
+        pass
+    hdrs = {}
+    for line in raw_hdrs.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            hdrs[k.strip()] = v.strip()
+    try:
+        return int(code_s.strip() or 0), body, hdrs
+    except Exception:
+        return None, body, hdrs
 
 
 def ssh_available():
@@ -586,38 +674,40 @@ def collect():
 
 def _collect():
     errors = []
-    # /top 默认只给 10 条，必须带 ?limit= 才能拿更多（与 logs 的 ?limit 同理）
-    cmd = ('curl -s --noproxy "*" -m 10 "%s/stats"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "%s/top?limit=%d"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "%s/history"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "http://127.0.0.1:9091/metrics" '
-           '| grep mosdns_cache_size_current'
-           % (STATS_API, SEP, STATS_API, TOP_FETCH, SEP, STATS_API, SEP))
-    out, err = run_cmd(cmd, 30)
-    if err:
-        errors.append("ssh: %s" % err)
-
-    parts = (out or "").split(SEP)
-    while len(parts) < 4:
-        parts.append("")
-    stats = _jload(parts[0])
-    top = _jload(parts[1])
-    history = _jload(parts[2])
-    for n, v in (("stats", stats), ("top", top), ("history", history)):
+    # 三个 API 走传输感知的 http_get：local 模式用 urllib（不需要 curl），
+    # ssh 模式才落到远端的 curl。
+    stats = top = history = None
+    for name, path in (("stats", "/stats"),
+                       ("top", "/top?limit=%d" % TOP_FETCH),
+                       ("history", "/history")):
+        code, body = http_get(STATS_API + path, timeout=10)
+        if code != 200:
+            errors.append("%s: HTTP %s" % (name, code))
+            continue
+        v = _jload(body)
         if v is None:
-            errors.append("%s: 未取到" % n)
+            errors.append("%s: 响应不是合法 JSON" % name)
+        elif name == "stats":
+            stats = v
+        elif name == "top":
+            top = v
+        else:
+            history = v
 
     logs, log_total = read_logs(LOG_DEFAULT)
     if log_total == 0:
         errors.append("logs: 本地累积库为空（后台线程可能尚未跑完首次采集）")
 
+    # 缓存条数在 Prometheus 指标里，用 Python 解析而不是 grep
     cache_size = None
-    for line in (parts[3] or "").splitlines():
-        if line.startswith("mosdns_cache_size_current"):
-            try:
-                cache_size = int(float(line.split()[-1]))
-            except Exception:
-                pass
+    code, body = http_get("http://%s/metrics" % MOSDNS_API_ADDR, timeout=10)
+    if code == 200:
+        for line in (body or "").splitlines():
+            if line.startswith("mosdns_cache_size_current"):
+                try:
+                    cache_size = int(float(line.split()[-1]))
+                except Exception:
+                    pass
 
     return {
         "host": MOSDNS_HOST,
@@ -731,12 +821,13 @@ def ingest():
         row = c.execute("SELECT v FROM meta WHERE k='last_log_id'").fetchone()
     last_id = row[0] if row else ""
 
-    out, err = run_cmd('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
-                   % (STATS_API, LOG_PAGE), 25)
-    j = _jload(out)
+    code, body = http_get(STATS_API + "/logs?limit=%d" % LOG_PAGE, timeout=12)
+    if code != 200:
+        return 0, "HTTP %s" % code
+    j = _jload(body)
     items = (j or {}).get("items") or []
     if not items:
-        return 0, err
+        return 0, None
 
     if last_id:
         new_items = []
@@ -1678,19 +1769,19 @@ def agh_login(force=False):
         _agh["err"] = "未配置 agh.conf"
         return False
     url = cfg["AGH_URL"].rstrip("/") + "/control/login"
-    body = json.dumps({"name": cfg.get("AGH_USER", ""),
-                       "password": cfg.get("AGH_PASS", "")})
-    cmd = ('curl -sk --noproxy "*" -m 8 -X POST "%s" '
-           '-H "Content-Type: application/json" '
-           "-D /tmp/agh-h.txt -o /tmp/agh-b.txt -d '%s'; "
-           "echo '@@@'; sed -n 's/^[Ss]et-[Cc]ookie: \\([^;]*\\).*/\\1/p' /tmp/agh-h.txt; "
-           "rm -f /tmp/agh-h.txt /tmp/agh-b.txt" % (url, body))
-    out, err = ssh(cmd, 20)
-    if err:
-        _agh["err"] = "ssh: %s" % err
+    code, body, hdrs = http_post_json(
+        url, {"name": cfg.get("AGH_USER", ""),
+              "password": cfg.get("AGH_PASS", "")}, timeout=8)
+    if code is None:
+        _agh["err"] = "请求失败: %s" % (body or "")
         return False
-    parts = (out or "").split("@@@")
-    cookie = (parts[1].strip() if len(parts) > 1 else "")
+    if code not in (200, 204):
+        _agh["err"] = "登录失败 HTTP %s（检查 agh.conf 里的账号密码）" % code
+        _agh["ok"] = False
+        return False
+    # Set-Cookie 可能有多个，取第一个；按分号切出 name=value
+    raw = hdrs.get("Set-Cookie") or hdrs.get("set-cookie") or ""
+    cookie = raw.split(";", 1)[0].strip()
     if not cookie:
         _agh["err"] = "登录失败（返回中无 cookie，检查 agh.conf 里的密码）"
         _agh["ok"] = False
@@ -1708,20 +1799,17 @@ def agh_get(path, timeout=20, retry=True):
         return None
     cfg = agh_conf()
     url = cfg["AGH_URL"].rstrip("/") + path
-    cmd = ('curl -sk --noproxy "*" -m 15 -w "\\n@@@HTTP%%{http_code}" -H "%s" "%s"'
-           % ("Cookie: " + _agh["cookie"], url))
-    out, err = ssh(cmd, timeout)
-    if err:
-        _agh["err"] = "ssh: %s" % err
+    code, body = http_get(url, timeout=timeout,
+                          headers={"Cookie": _agh["cookie"]})
+    if code is None:
+        _agh["err"] = "请求失败: %s" % (body or "")
         return None
-    body, _, code = (out or "").rpartition("@@@HTTP")
-    code = code.strip()
-    if code in ("401", "403") and retry:
+    if code in (401, 403) and retry:
         _agh["cookie"] = ""
         if agh_login(force=True):
             return agh_get(path, timeout, retry=False)
         return None
-    if code != "200":
+    if code != 200:
         _agh["err"] = "HTTP %s" % code
         return None
     try:
@@ -2307,8 +2395,10 @@ def query(name):
 
 
 def _jload_pull_logs():
-    out, _ = run_cmd('curl -s --noproxy "*" -m 10 "%s/logs"' % STATS_API, 20)
-    j = _jload(out)
+    code, body = http_get(STATS_API + "/logs", timeout=10)
+    if code != 200:
+        return []
+    j = _jload(body)
     return (j or {}).get("items") or []
 
 
@@ -3034,9 +3124,9 @@ class Handler(BaseHTTPRequestHandler):
                 checks["transport"] = "ssh"
                 checks["ssh"] = ok_ssh
             try:
-                out, err = run_cmd(
-                    'curl -s --noproxy "*" -m 3 "%s/stats"' % STATS_API, 5)
-                checks["mosdns"] = bool(err is None and out and len(out) > 10)
+                code, body = http_get(STATS_API + "/stats", timeout=3)
+                checks["mosdns"] = bool(code == 200 and body
+                                        and len(body) > 10)
             except Exception:
                 checks["mosdns"] = False
             # --- 可选集成：没配就是 None（未启用），配了但连不上才是 False ---

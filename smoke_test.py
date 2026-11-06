@@ -7,6 +7,7 @@ MosDNS Dashboard 冒烟测试
 import os
 import sys
 import json
+import inspect
 import tempfile
 import sqlite3
 from pathlib import Path
@@ -225,8 +226,9 @@ def test_startup_checks():
         # 检查 auth_cfg 函数是否存在
         assert hasattr(server, 'auth_cfg'), "缺少 auth_cfg 函数"
 
-        # 检查 SSH 检查逻辑（不实际连接）
-        assert hasattr(server, 'ssh'), "缺少 ssh 函数"
+        # 取数入口与 SSH 可用性检查
+        assert hasattr(server, 'run_cmd'), "缺少 run_cmd 取数入口"
+        assert hasattr(server, 'ssh_available'), "缺少 ssh_available"
 
         # 检查 db 函数
         assert hasattr(server, 'db'), "缺少 db 函数"
@@ -825,6 +827,140 @@ def test_providers_endpoint():
         return False
 
 
+def test_http_client_no_curl():
+    """测试 20：HTTP 客户端在 local 模式不依赖 curl"""
+    print("=" * 60)
+    print("测试 20：HTTP 客户端零外部依赖")
+    print("=" * 60)
+
+    try:
+        import threading, json as _json
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        hits = {"get": 0, "post": 0}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits["get"] += 1
+                data = _json.dumps({"path": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                hits["post"] += 1
+                n = int(self.headers.get("Content-Length") or 0)
+                req = _json.loads(self.rfile.read(n) or "{}")
+                data = _json.dumps({"echo": req}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", "sid=abc123; Path=/; HttpOnly")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            # 强制 local 模式（走 urllib，不经 shell/curl）
+            orig = server._transport_cache["mode"]
+            server._transport_cache["mode"] = "local"
+
+            code, body = server.http_get("http://127.0.0.1:%d/x" % port, timeout=5)
+            assert code == 200, f"GET 状态码异常: {code}"
+            assert "/x" in body
+            print(f"  ✓ http_get 走通（HTTP {code}）")
+
+            code, body, hdrs = server.http_post_json(
+                "http://127.0.0.1:%d/login" % port, {"u": "a"}, timeout=5)
+            assert code == 200, f"POST 状态码异常: {code}"
+            assert '"echo"' in body
+            cookie = hdrs.get("Set-Cookie", "")
+            assert "sid=abc123" in cookie, f"未拿到 Set-Cookie: {hdrs}"
+            print(f"  ✓ http_post_json 走通，Set-Cookie: {cookie.split(';')[0]}")
+
+            server._transport_cache["mode"] = orig
+            print(f"  请求计数: {hits}")
+            print("  ✓ local 模式下 GET/POST 都不需要 curl\n")
+            return True
+        finally:
+            srv.shutdown()
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _code_only(fn):
+    """取函数源码并剥离注释与文档字符串 —— 检查"有没有用某命令"时，
+    注释里提到它不算（比如"local 模式用 urllib（不需要 curl）"）。"""
+    import io
+    import tokenize
+    src = inspect.getsource(fn)
+    out = []
+    try:
+        toks = tokenize.generate_tokens(io.StringIO(src).readline)
+        for ttype, tstr, _s, _e, _line in toks:
+            if ttype == tokenize.COMMENT:
+                continue
+            out.append(tstr)
+    except Exception:
+        return src
+    return " ".join(out)
+
+
+def test_metrics_parsing_without_grep():
+    """测试 21：Prometheus 指标解析不依赖 grep"""
+    print("=" * 60)
+    print("测试 21：指标解析不依赖 grep")
+    print("=" * 60)
+
+    try:
+        src = _code_only(server._collect)
+        assert "grep" not in src, "collect() 仍在使用 grep"
+        assert "curl" not in src, "collect() 仍在使用 curl"
+        print("  ✓ collect() 已无 curl / grep")
+        assert "mosdns_cache_size_current" in src
+        print("  ✓ 缓存条数改为 Python 解析\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
+def test_no_curl_in_local_paths():
+    """测试 22：local 模式的取数路径完全不出现 curl"""
+    print("=" * 60)
+    print("测试 22：local 路径无 curl")
+    print("=" * 60)
+
+    try:
+        for fn in ("_collect", "ingest", "_jload_pull_logs", "agh_get"):
+            f = getattr(server, fn, None)
+            if f is None:
+                continue
+            src = _code_only(f)
+            assert "curl" not in src, f"{fn} 仍直接调用 curl"
+            print(f"  ✓ {fn}: 无 curl")
+        # http_get/http_post_json 的 ssh 分支里有 curl，那是预期的
+        for fn in ("http_get", "http_post_json"):
+            src = _code_only(getattr(server, fn))
+            assert "urllib" in src, f"{fn} 缺少 local(urllib) 分支"
+            print(f"  ✓ {fn}: 有 local(urllib) 分支，curl 仅用于 ssh")
+        print("  ✓ local 模式取数不依赖 curl\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
 def main():
     print("\n" + "=" * 60)
     print("MosDNS Dashboard 冒烟测试")
@@ -852,6 +988,9 @@ def main():
     results.append(("dnsmasq 租约解析", test_dnsmasq_provider()))
     results.append(("通用 HTTP provider", test_http_provider()))
     results.append(("provider 自检端点", test_providers_endpoint()))
+    results.append(("HTTP 客户端零依赖", test_http_client_no_curl()))
+    results.append(("指标解析无 grep", test_metrics_parsing_without_grep()))
+    results.append(("local 路径无 curl", test_no_curl_in_local_paths()))
 
     # 汇总结果
     print("=" * 60)

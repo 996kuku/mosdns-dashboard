@@ -161,7 +161,9 @@ systemctl enable --now mosdns-dashboard
 | `local` | MosDNS 与面板同机、Docker 部署 —— 不需要 SSH，纯 Python 读配置 |
 | `ssh` | 面板在另一台机器，通过 SSH 到路由器取数（现有行为） |
 
-`local` 模式下**不依赖** `ssh` / `curl` / `dig` / `base64`，只需要 Python 标准库。
+`local` 模式下**不依赖** `ssh` / `curl` / `dig` / `base64`，只需要 Python 标准库。所有 HTTP 请求走 `urllib`，DNS 查询是手写的 DNS 报文实现。
+
+> AGH 和爱快都用自签证书，`local` 模式下默认不校验证书（`DASH_STRICT_TLS=1` 可开启校验）。
 
 ### 设备数据源（可插拔）
 
@@ -208,6 +210,7 @@ DEVICE_PROVIDERS=dnsmasq,agh,manual
 - **MAC 地址来源**：`ip neigh`（自动接口 → 不限接口）→ `/proc/net/arp` → `arp -a`（Windows/macOS）
 - **邻居表格式**：BusyBox（`IP lladdr MAC`）和 iproute2（`IP dev X lladdr MAC`）都能解析
 - **Python 解释器**：ssh 模式下按 `python3` → `python` → `python3.12` → `python3.11` → `python3.10` 逐个尝试
+- **HTTP 请求**：`local` 模式用 `urllib`，不再依赖 `curl`；DNS 查询是标准库实现，不再依赖 `dig`
 
 建议写进 systemd drop-in（模板见 `deploy/mosdns-dashboard.service` 末尾注释）。
 
