@@ -21,9 +21,11 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import socket
 import ssl
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -32,16 +34,65 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
+# ---------- 路径基准（配置区要用，必须最先定义）----------
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME_DIR = os.path.expanduser("~") or os.environ.get("HOME", ".")
+
 # ---------- 配置 ----------
+# 所有默认值都可用环境变量覆盖；路径类默认值以 HERE 为基准，
+# 这样换成 /app（Docker）、~/mosdns-dashboard（用户目录）都不用改代码。
 LISTEN_HOST = os.environ.get("DASH_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("DASH_PORT", "8088"))
-TLS_CERT = os.environ.get("DASH_TLS_CERT", "/opt/mosdns-dashboard/ssl/server.pem")
-TLS_KEY  = os.environ.get("DASH_TLS_KEY",  "/opt/mosdns-dashboard/ssl/server.key")
+TLS_CERT = os.environ.get("DASH_TLS_CERT", os.path.join(HERE, "ssl", "server.pem"))
+TLS_KEY  = os.environ.get("DASH_TLS_KEY",  os.path.join(HERE, "ssl", "server.key"))
+
+# ---- 传输方式 ----
+# auto   ：配置文件在本机就直接读，否则走 SSH（默认，兼容老部署）
+# local  ：强制本机执行（MosDNS 与面板同机 / Docker 部署）
+# ssh    ：强制 SSH（现有行为）
+TRANSPORT = os.environ.get("MOSDNS_TRANSPORT", "auto").strip().lower()
 MOSDNS_HOST = os.environ.get("MOSDNS_HOST", "192.168.1.1")
 MOSDNS_USER = os.environ.get("MOSDNS_USER", "root")
-SSH_KEY = os.environ.get("MOSDNS_SSH_KEY", "/root/.ssh/id_ed25519_mosdns")
-STATS_API = "http://127.0.0.1:9091/plugins/stats_collector/api/v1"
-MOSDNS_PORT = 5335
+SSH_KEY = os.environ.get("MOSDNS_SSH_KEY", os.path.join(HOME_DIR, ".ssh", "id_ed25519_mosdns"))
+SSH_PORT = int(os.environ.get("MOSDNS_SSH_PORT", "22"))
+SSH_OPTS = [x for x in os.environ.get("MOSDNS_SSH_OPTS", "").split() if x]
+
+# ---- MosDNS ----
+# API 地址与插件路径分开：换了 MosDNS 版本只改路径，换了端口只改地址
+MOSDNS_API_ADDR = os.environ.get("MOSDNS_API_ADDR", "127.0.0.1:9091")
+MOSDNS_API_PATH = os.environ.get("MOSDNS_API_PATH",
+                                 "/plugins/stats_collector/api/v1")
+STATS_API = "http://%s%s" % (MOSDNS_API_ADDR, MOSDNS_API_PATH)
+MOSDNS_PORT = int(os.environ.get("MOSDNS_PORT", "5335"))
+# 配置文件位置：写死路径在不同部署下必然踩坑，改成候选列表自动探测
+MOSDNS_CFG_PATH = os.environ.get("MOSDNS_CFG_PATH", "")
+MOSDNS_CFG_CANDIDATES = [
+    MOSDNS_CFG_PATH,
+    "/var/etc/mosdns.json",
+    "/etc/mosdns.json",
+    "/etc/mosdns/mosdns.json",
+    "/usr/local/etc/mosdns.json",
+    os.path.join(HERE, "mosdns.json"),
+]
+MOSDNS_CFG_CANDIDATES = [p for p in MOSDNS_CFG_CANDIDATES if p]
+# 远端执行脚本用的解释器候选（精简系统可能只装了 python 或 python3.11）
+MOSDNS_PY_CANDS = [x for x in os.environ.get(
+    "MOSDNS_PY_CANDS", "python3,python,python3.12,python3.11,python3.10").split(",") if x]
+
+# ---- 设备数据源 ----
+# auto：启用所有探测到的 provider（默认）
+# 逗号分隔：只用指定的，顺序即优先级（后者覆盖前者）
+DEVICE_PROVIDERS = os.environ.get("DEVICE_PROVIDERS", "auto").strip()
+# 通用 HTTP provider：任意能返回 JSON 的接口都能当设备名来源
+DEV_HTTP_URL = os.environ.get("DEV_HTTP_URL", "")
+# 返回结构支持两种：数组 [{ip,name}] 或对象 {ip: name}
+DEV_HTTP_TIMEOUT = int(os.environ.get("DEV_HTTP_TIMEOUT", "8"))
+
+# ---- 局域网接口 ----
+# 写死 br-lan 在 x86 软路由 / VLAN / 爱快主路由上都会拿不到 MAC
+LAN_IFACE = os.environ.get("LAN_IFACE", "")
+LAN_IFACE_CANDIDATES = [x for x in os.environ.get(
+    "LAN_IFACE_CANDIDATES", "br-lan,br0,eth0,eth1,ens18,ens19,enp1s0").split(",") if x]
 CACHE_TTL = 10           # 快照缓存秒数（普通 /api/snapshot 用；SSE 不走这个缓存）
 # ---- 实时推送（SSE）----
 # PUSH_INTERVAL 是"有人在看面板"时的采集间隔；没人看时降到 PUSH_IDLE_INTERVAL，
@@ -69,15 +120,24 @@ TOP_SHOW = 50            # 页面榜单展示条数（热门 / 拦截都是 50�
 TOP_FETCH = 150          # 向 MosDNS 拉取的条数；多拉一些，基线差分过滤掉后仍够 50 条
 AGH_PAGE = 500           # 单次从 AGH querylog 拉取的条数（它没有 500 的硬上限，但没必要太多）
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX = os.path.join(HERE, "index.html")
 STATIC_DIR = os.path.join(HERE, "static")
-SEP = "@@@MOSDNS-SPLIT@@@"
-AGH_CONF = os.path.join(HERE, "agh.conf")
+
+# 运行数据（数据库、配置）的落点。
+# 默认与代码同目录（源码部署时最方便）；容器里指向挂载的 volume，
+# 这样重建镜像不会丢历史数据。
+DATA_DIR = os.environ.get("DATA_DIR", HERE)
+if not os.path.isdir(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        DATA_DIR = HERE          # 建不了就退回代码目录，至少能跑
+
+AGH_CONF = os.path.join(DATA_DIR, "agh.conf")
 # 设备名映射（可选）：一行一条 "192.168.1.200=我的台式机"，放在 devices.conf 里
-DEV_CONF = os.path.join(HERE, "devices.conf")
+DEV_CONF = os.path.join(DATA_DIR, "devices.conf")
 # 登录认证：auth.conf（AUTH_ENABLE=1 时生效；账号/密码哈希/会话密钥都在里面，权限 600）
-AUTH_CONF = os.path.join(HERE, "auth.conf")
+AUTH_CONF = os.path.join(DATA_DIR, "auth.conf")
 LOGIN_PAGE = os.path.join(HERE, "login.html")
 SESS_COOKIE = "mdash_sess"
 SESS_DAYS = 7                    # 登录状态保持天数
@@ -101,14 +161,43 @@ _sse_lock = threading.Lock()
 _last_sig = {"v": None}
 
 
-# ---------- SSH ----------
-def ssh(cmd, timeout=25):
+# ---------- 传输层 ----------
+# 面板取数有两种落点：MosDNS 在本机，或者在远端路由器上。
+# 以前只有 SSH 一条路 —— 本机部署、Docker、没有 OpenSSH 的环境
+# （比如 Windows）全都用不了。这里统一成 run_cmd()，按 TRANSPORT 分派。
+_transport_cache = {"mode": None}
+
+
+def _local_cmd(cmd, timeout):
+    """在本机直接执行命令（MosDNS 与面板同机时用）
+
+    ⚠️ 传 list 时不走 shell，避免 Windows 的 cmd.exe 与 POSIX 引号规则打架
+       （shlex.quote 生成单引号，cmd.exe 不认，会把引号当成路径的一部分）。
+       传 str 时才走 shell —— 那种情况下命令里的重定向/管道是必需的。
+    """
+    try:
+        if isinstance(cmd, (list, tuple)):
+            p = subprocess.run(list(cmd), capture_output=True, timeout=timeout)
+        else:
+            p = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "local command timeout"
+    except Exception as e:
+        return None, str(e)
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip()[:300]
+        return None, err or ("exit %d" % p.returncode)
+    return p.stdout.decode("utf-8", "replace"), None
+
+
+def _ssh_cmd(cmd, timeout):
     full = ["ssh", "-i", SSH_KEY,
+            "-p", str(SSH_PORT),
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
-            "-o", "LogLevel=ERROR",
-            "%s@%s" % (MOSDNS_USER, MOSDNS_HOST), cmd]
+            "-o", "LogLevel=ERROR"] + SSH_OPTS + \
+           ["%s@%s" % (MOSDNS_USER, MOSDNS_HOST), cmd]
     try:
         p = subprocess.run(full, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -118,6 +207,152 @@ def ssh(cmd, timeout=25):
     if p.returncode != 0:
         return None, p.stderr.decode("utf-8", "replace").strip()[:300]
     return p.stdout.decode("utf-8", "replace"), None
+
+
+def _resolve_transport():
+    """决定用哪种传输方式。结果缓存，启动后不再变。
+
+    auto 的判定顺序：
+      1. 本机存在 MosDNS 配置文件 → local（同机部署最省资源）
+      2. 存在 SSH 私钥 → ssh（兼容所有老部署，行为不变）
+      3. 都没有 → 仍然返回 ssh，让后续调用去报错，
+         错误信息里会提示怎么配（避免静默变成 local 而后拿不到数据）
+    """
+    mode = TRANSPORT
+    if mode not in ("auto", "local", "ssh"):
+        sys.stderr.write("[transport] 未知 MOSDNS_TRANSPORT=%r，回退 auto\n" % mode)
+        mode = "auto"
+    if mode == "auto":
+        if any(os.path.exists(p) for p in MOSDNS_CFG_CANDIDATES):
+            mode = "local"
+        else:
+            mode = "ssh"
+    return mode
+
+
+def transport_mode():
+    if _transport_cache["mode"] is None:
+        _transport_cache["mode"] = _resolve_transport()
+    return _transport_cache["mode"]
+
+
+def run_cmd(cmd, timeout=25):
+    """在 MosDNS 所在机器上执行命令，返回 (stdout, err)
+
+    这是取数的**唯一**入口 —— 所有采集函数都走它，
+    这样换部署环境只需要改 MOSDNS_TRANSPORT，不用动业务代码。
+    """
+    if transport_mode() == "local":
+        return _local_cmd(cmd, timeout)
+    return _ssh_cmd(cmd, timeout)
+
+
+# ---- 传输感知的 HTTP 客户端 ----
+# 以前所有 HTTP 请求都靠 shell 里的 curl。curl 在精简系统
+# （Alpine、OpenWrt 精简镜像、多数 Docker 镜像）里默认不带，
+# 而且要拼一串引号转义。这里改成：
+#   local 模式 → urllib（标准库，零依赖）
+#   ssh 模式   → 仍然用 curl（远端机器上通常有）
+#
+# AGH 和爱快都用自签证书，所以默认不做证书校验 ——
+# 反正只从内网访问，换取「不依赖任何外部工具」是值得的。
+_SSL_RELAXED = os.environ.get("DASH_STRICT_TLS", "0") != "1"
+
+
+def _ssl_ctx_relaxed():
+    if not _SSL_RELAXED:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def http_get(url, timeout=10, headers=None):
+    """GET 一个 URL，返回 (状态码, body)；失败返回 (None, 错误说明)"""
+    if transport_mode() == "local":
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_ssl_ctx_relaxed()) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception as e:
+            return None, str(e)
+    cmd = 'curl -s --noproxy "*" -m %d -w "\\n@@@HTTP%%{http_code}" "%s"' % (
+        int(timeout), url)
+    if headers:
+        for k, v in headers.items():
+            cmd += ' -H "%s: %s"' % (k, v)
+    out, err = run_cmd(cmd, timeout)
+    if err:
+        return None, err
+    body, _, code = (out or "").rpartition("@@@HTTP")
+    try:
+        return int(code.strip() or 0), body
+    except Exception:
+        return None, "无法解析响应"
+
+
+def http_post_json(url, payload, timeout=10):
+    """POST JSON，返回 (状态码, body, 响应头 dict)"""
+    body_in = json.dumps(payload, ensure_ascii=False)
+    if transport_mode() == "local":
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=body_in.encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_ssl_ctx_relaxed()) as r:
+                hdrs = {k: v for k, v in r.headers.items()}
+                return r.status, r.read().decode("utf-8", "replace"), hdrs
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace"), {}
+        except Exception as e:
+            return None, str(e), {}
+    # ssh 模式：用临时文件存响应头，避开 shell 引号地狱
+    import tempfile
+    hdrs_path = tempfile.mktemp(prefix="mdash_h_")
+    cmd = ('curl -sk --noproxy "*" -m %d -X POST "%s" '
+           '-H "Content-Type: application/json" '
+           '-D %s -o %s -d %s; echo "@@@HTTP%%{http_code}"; '
+           'cat %s 2>/dev/null; rm -f %s %s'
+           % (int(timeout), url, shlex.quote(hdrs_path), shlex.quote(hdrs_path + ".b"),
+              shlex.quote(body_in), shlex.quote(hdrs_path),
+              shlex.quote(hdrs_path), shlex.quote(hdrs_path + ".b")))
+    out, err = run_cmd(cmd, timeout)
+    if err:
+        return None, err, {}
+    raw_body, _, tail = (out or "").rpartition("@@@HTTP")
+    code_s, _, raw_hdrs = tail.partition("\n")
+    body = ""
+    try:
+        with open(hdrs_path + ".b", "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    except Exception:
+        pass
+    hdrs = {}
+    for line in raw_hdrs.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            hdrs[k.strip()] = v.strip()
+    try:
+        return int(code_s.strip() or 0), body, hdrs
+    except Exception:
+        return None, body, hdrs
+
+
+def ssh_available():
+    """SSH 那条路本身是否可用（给健康检查用，不触发自动降级）"""
+    if not os.path.exists(SSH_KEY):
+        return False, "SSH key 不存在: %s" % SSH_KEY
+    out, err = _ssh_cmd("echo OK", 5)
+    if err:
+        return False, err
+    return ("OK" in (out or "")), ""
 
 
 def _jload(txt):
@@ -146,16 +381,24 @@ _up_lock = threading.Lock()
 # 用 base64 传输是为了绕开 ssh -> sh -> python 三层的引号转义地狱。
 # ⚠️ 这个脚本只 open(..., "r") 读配置，不做任何写操作 / 不改路由器的任何状态。
 _UP_CFG_PY = """
-import json, socket
+import json, socket, sys
 def is_ip(s):
     try:
         socket.inet_aton(s); return True
     except Exception:
         return ":" in s
-try:
-    j = json.load(open("/var/etc/mosdns.json"))
-except Exception as e:
-    print(json.dumps({"error": str(e)})); raise SystemExit
+paths = sys.argv[1:]
+j = None
+for p in paths:
+    try:
+        j = json.load(open(p)); break
+    except FileNotFoundError:
+        continue
+    except Exception as e:
+        print(json.dumps({"error": "%s: %s" % (p, e)})); raise SystemExit
+if j is None:
+    print(json.dumps({"error": "no mosdns config found in %s" % paths}))
+    raise SystemExit
 fwd = []
 for p in j.get("plugins", []):
     if p.get("type") != "forward":
@@ -198,8 +441,33 @@ def read_upstream_cfg(force=False):
         if (not force and _up_cfg["data"] is not None
                 and (now - _up_cfg["ts"]) < UP_CFG_TTL):
             return _up_cfg["data"], _up_cfg["err"]
-    b64 = base64.b64encode(_UP_CFG_PY.encode("utf-8")).decode("ascii")
-    out, err = ssh('echo "%s" | base64 -d | python3' % b64, 25)
+    # 配置路径作为 argv 传给 python（脚本内 sys.argv[1:]），
+    # 逐个候选尝试，路径里即使有空格/引号也安全（shlex.quote）。
+    args = " ".join(shlex.quote(p) for p in MOSDNS_CFG_CANDIDATES)
+    if transport_mode() == "local":
+        # 本机执行：写临时脚本，用参数列表直接跑，完全绕开 shell
+        # （Windows 的 cmd.exe 不认 POSIX 引号，走 shell 必踩坑）
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".py", prefix="mdash_up_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(_UP_CFG_PY)
+            out, err = run_cmd([sys.executable, tmp] + MOSDNS_CFG_CANDIDATES, 25)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    else:
+        # SSH 到 Linux：解释器做候选，精简系统可能只有 python / python3.11
+        b64 = base64.b64encode(_UP_CFG_PY.encode("utf-8")).decode("ascii")
+        py_list = " ".join(MOSDNS_PY_CANDS)
+        cmd = ('for P in %s; do '
+               '  command -v $P >/dev/null 2>&1 || continue; '
+               '  OUT=$(echo "%s" | base64 -d | $P - %s 2>/dev/null); '
+               '  if [ -n "$OUT" ]; then echo "$OUT"; break; fi; '
+               'done') % (py_list, b64, args)
+        out, err = run_cmd(cmd, 25)
     data = _jload(out)
     if not (data and isinstance(data.get("forward"), list)):
         # 取不到就退回上一次的缓存（有总比没有好），把错误如实带出去给前端提示。
@@ -395,41 +663,62 @@ def read_upstreams():
 
 
 # ---------- 采集 ----------
-def collect():
-    """一次 SSH 拉齐 stats / top / history / 缓存条数；日志走本地累积库"""
-    errors = []
-    # /top 默认只给 10 条，必须带 ?limit= 才能拿更多（与 logs 的 ?limit 同理）
-    cmd = ('curl -s --noproxy "*" -m 10 "%s/stats"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "%s/top?limit=%d"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "%s/history"; echo "%s"; '
-           'curl -s --noproxy "*" -m 10 "http://127.0.0.1:9091/metrics" '
-           '| grep mosdns_cache_size_current'
-           % (STATS_API, SEP, STATS_API, TOP_FETCH, SEP, STATS_API, SEP))
-    out, err = ssh(cmd, 30)
-    if err:
-        errors.append("ssh: %s" % err)
+_collect_lock = threading.Lock()
 
-    parts = (out or "").split(SEP)
-    while len(parts) < 4:
-        parts.append("")
-    stats = _jload(parts[0])
-    top = _jload(parts[1])
-    history = _jload(parts[2])
-    for n, v in (("stats", stats), ("top", top), ("history", history)):
+
+def _prom_label(v):
+    """转义 Prometheus 标签值：反斜杠、双引号、换行（exposition 格式要求）"""
+    return (str(v).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n"))
+
+
+def collect():
+    """一次 SSH 拉齐 stats / top / history / 缓存条数；日志走本地累积库
+
+    ⚠️ 采集走 4 次 SSH 子调用，是全局最重的操作。必须串行 ——
+       否则 push_loop(2s)、sample_min(60s)、sample_hour(3600s)、
+       /metrics、/api/clear 同时触发时会打出多个并发 SSH 会话，
+       把路由器压垮。取不到锁时等待，等完拿到的就是更新后的结果。"""
+    with _collect_lock:
+        return _collect()
+
+
+def _collect():
+    errors = []
+    # 三个 API 走传输感知的 http_get：local 模式用 urllib（不需要 curl），
+    # ssh 模式才落到远端的 curl。
+    stats = top = history = None
+    for name, path in (("stats", "/stats"),
+                       ("top", "/top?limit=%d" % TOP_FETCH),
+                       ("history", "/history")):
+        code, body = http_get(STATS_API + path, timeout=10)
+        if code != 200:
+            errors.append("%s: HTTP %s" % (name, code))
+            continue
+        v = _jload(body)
         if v is None:
-            errors.append("%s: 未取到" % n)
+            errors.append("%s: 响应不是合法 JSON" % name)
+        elif name == "stats":
+            stats = v
+        elif name == "top":
+            top = v
+        else:
+            history = v
 
     logs, log_total = read_logs(LOG_DEFAULT)
     if log_total == 0:
         errors.append("logs: 本地累积库为空（后台线程可能尚未跑完首次采集）")
 
+    # 缓存条数在 Prometheus 指标里，用 Python 解析而不是 grep
     cache_size = None
-    for line in (parts[3] or "").splitlines():
-        if line.startswith("mosdns_cache_size_current"):
-            try:
-                cache_size = int(float(line.split()[-1]))
-            except Exception:
-                pass
+    code, body = http_get("http://%s/metrics" % MOSDNS_API_ADDR, timeout=10)
+    if code == 200:
+        for line in (body or "").splitlines():
+            if line.startswith("mosdns_cache_size_current"):
+                try:
+                    cache_size = int(float(line.split()[-1]))
+                except Exception:
+                    pass
 
     return {
         "host": MOSDNS_HOST,
@@ -455,7 +744,7 @@ def collect():
 # ---------- 日志累积 ----------
 # MosDNS 单次最多只吐 500 条（?limit=5000 也一样），要看 2000 条只能自己攒。
 # 后台线程每 INGEST_INTERVAL 秒拉一次，按 id 去重写进 SQLite，只保留最近 LOG_KEEP 条。
-DB_PATH = os.path.join(HERE, "logs.db")
+DB_PATH = os.path.join(DATA_DIR, "logs.db")
 _db_lock = threading.Lock()
 _conn = None
 
@@ -464,6 +753,13 @@ def db():
     global _conn
     if _conn is None:
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        # 性能优化：WAL 模式、同步级别、超时、缓存
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA busy_timeout=5000")
+        _conn.execute("PRAGMA cache_size=-64000")  # 64MB
+        _conn.execute("PRAGMA temp_store=MEMORY")
+        _conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory map
         _conn.execute("""CREATE TABLE IF NOT EXISTS logs(
             id TEXT PRIMARY KEY, ts TEXT, domain TEXT, qtype TEXT, status TEXT,
             blocked INTEGER, cached INTEGER, elapsed REAL, upstream TEXT,
@@ -522,18 +818,50 @@ def _row_of(it):
 
 
 def ingest():
-    out, err = ssh('curl -s --noproxy "*" -m 12 "%s/logs?limit=%d"'
-                   % (STATS_API, LOG_PAGE), 25)
-    j = _jload(out)
+    """增量拉取 MosDNS 日志
+
+    ⚠️ MosDNS 的 /logs 接口**没有** after/since 参数，所以仍然要拉全量
+       500 条再在本地过滤 —— 省的不是带宽，而是无谓的 INSERT。
+       过滤用 last_log_id 做「已处理水位线」：
+         遇到它就把后面的丢掉（它是上一轮处理过的最新一条）。
+       如果它已经滑出窗口（高流量时会被挤掉），就整批当作新数据处理，
+       靠 INSERT OR IGNORE 去重 —— 不会写重复，只是这一轮做无用功。
+    """
+    c = db()
+    with _db_lock:
+        row = c.execute("SELECT v FROM meta WHERE k='last_log_id'").fetchone()
+    last_id = row[0] if row else ""
+
+    code, body = http_get(STATS_API + "/logs?limit=%d" % LOG_PAGE, timeout=12)
+    if code != 200:
+        return 0, "HTTP %s" % code
+    j = _jload(body)
     items = (j or {}).get("items") or []
     if not items:
-        return 0, err
+        return 0, None
+
+    if last_id:
+        new_items = []
+        for it in items:
+            if it.get("id") == last_id:
+                break
+            new_items.append(it)
+        items = new_items
+
+    if not items:
+        return 0, None
+
     rows = [_row_of(x) for x in items if x.get("id")]
-    c = db()
     with _db_lock:
         c.executemany("INSERT OR IGNORE INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         c.execute("DELETE FROM logs WHERE id NOT IN "
                   "(SELECT id FROM logs ORDER BY ts DESC, id DESC LIMIT ?)", (LOG_KEEP,))
+        # 水位线只往前推：万一这轮拿到的批次比已记录的还旧（窗口回绕），
+        # 不要把 last_log_id 改回去，否则下一轮会重复处理同一批。
+        new_top = items[0].get("id") or ""
+        if new_top and new_top != last_id:
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_log_id',?)",
+                      (new_top,))
         c.commit()
     return len(rows), err
 
@@ -608,8 +936,17 @@ _mac_cache = {"ts": 0.0, "map": {}}
 
 
 def macs_now():
+    """IP → MAC。走多数据源：dnsmasq 租约文件也带 MAC，
+    比 ARP 表更全（ARP 只保留最近通信过的设备）。"""
     if time.time() - _mac_cache["ts"] > 60:
-        _mac_cache["map"] = read_macs()
+        merged = {}
+        try:
+            merged.update(device_providers()["macs"])
+        except Exception:
+            pass
+        if not merged:                      # provider 全挂时退回纯 ARP
+            merged = read_macs()
+        _mac_cache["map"] = merged
         _mac_cache["ts"] = time.time()
     return _mac_cache["map"]
 
@@ -640,18 +977,22 @@ def read_alogs(n=LOG_DEFAULT):
 
 
 def read_client_top(limit=30):
-    """按客户端统计查询量（从 alogs 现算，不依赖 AGH 的统计接口）"""
+    """按客户端统计查询量（从 alogs 现算，不依赖 AGH 的统计接口）
+
+    设备信息走多数据源合并（provider 体系），
+    设备名优先级：手动 devices.conf > HTTP > 爱快 > AGH > dnsmasq
+    """
     conn = db()
     with _db_lock:
         rows = conn.execute(
             "SELECT client, COUNT(*) c, SUM(blocked) b FROM alogs "
             "GROUP BY client ORDER BY c DESC LIMIT ?", (int(limit),)).fetchall()
-    dev = dev_names()
-    macs = macs_now()
-    hosts = _ik.get("host") or {}
+    info = device_providers()
+    dev, macs, hosts = info["names"], info["macs"], info["hosts"]
     return [{"ip": r[0], "mac": macs.get(r[0], ""), "c": int(r[1] or 0),
              "b": int(r[2] or 0), "name": dev.get(r[0], ""),
-             "host": hosts.get(r[0], "")} for r in rows]
+             "host": hosts.get(r[0], ""),
+             "sources": info.get("sources") or []} for r in rows]
 
 
 def _norm_log_ts(ts):
@@ -1055,6 +1396,194 @@ def load_devices():
     return dev
 
 
+# ---------- 设备数据源（可插拔）----------
+# 设备名/MAC 的来源不止爱快一种：dnsmasq 的租约文件、AGH 客户端列表、
+# ARP 表、任意 HTTP 接口都可以。这里做成 provider 注册表，
+# 按优先级依次取、依次合并，谁先谁后**低优先级不覆盖高优先级**。
+#
+# 每个 provider 是一个函数，返回 {"names": {ip: name}, "macs": {...}, "hosts": {...}}，
+# 取不到数据就返回 None（失败）或 {}（无数据），异常由调用方吞掉。
+_PROVIDER_TTL = 60          # 各 provider 结果缓存秒数
+_provider_cache = {}        # name -> {"ts": float, "data": dict}
+
+
+def _provider_result(name, fn):
+    """跑一个 provider 并缓存结果；失败返回 None"""
+    now = time.time()
+    c = _provider_cache.get(name)
+    if c and now - c["ts"] < _PROVIDER_TTL:
+        return c["data"]
+    try:
+        data = fn() or {}
+    except Exception as e:
+        sys.stderr.write("[provider:%s] 失败: %s\n" % (name, e))
+        data = None
+    if data is not None:
+        # 字段补齐，避免调用方判空
+        data.setdefault("names", {})
+        data.setdefault("macs", {})
+        data.setdefault("hosts", {})
+        _provider_cache[name] = {"ts": now, "data": data}
+    return data
+
+
+def _p_manual():
+    """devices.conf：手动配置，优先级最高"""
+    return {"names": load_devices(), "macs": {}, "hosts": {}}
+
+
+def _p_arp():
+    """ARP / 邻居表：只要能连上网的机器都有，兜底最可靠"""
+    return {"names": {}, "macs": read_macs(), "hosts": {}}
+
+
+def _p_dnsmasq():
+    """dnsmasq 租约文件：OpenWrt 上 dnsmasq 是默认 DHCP，白送的数据源
+
+    格式：<expire> <mac> <ip> <hostname> <client-id>
+    hostname 为 * 时表示客户端没上报名字。
+    """
+    paths = [os.environ.get("DNSMASQ_LEASES", ""),
+             "/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases",
+             "/var/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"]
+    names, macs = {}, {}
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    p2 = line.split()
+                    if len(p2) < 4:
+                        continue
+                    mac, ip, host = p2[1].lower(), p2[2], p2[3]
+                    if ":" in mac:
+                        macs[ip] = mac
+                    if host and host != "*":
+                        names[ip] = host
+            break
+        except Exception:
+            continue
+    return {"names": names, "macs": macs, "hosts": names}
+
+
+def _p_agh():
+    """AdGuard Home 客户端列表（已依赖 AGH 的部署白送）"""
+    if not os.path.exists(AGH_CONF):
+        return None
+    j = agh_get("/control/clients")
+    clients = (j or {}).get("clients") or []
+    names = {}
+    for c in clients:
+        nm = (c.get("name") or "").strip()
+        for a in (c.get("ids") or []):
+            if a and nm:
+                names[a] = nm
+    return {"names": names, "macs": {}, "hosts": {}}
+
+
+def _p_ikuai():
+    """爱快 DHCP 租约表（现有的 iKuai 实现）"""
+    if not os.path.exists(IK_CONF):
+        return None
+    n = ik_names()
+    if not n:
+        return None
+    return {"names": n, "macs": {}, "hosts": _ik.get("host") or {}}
+
+
+def _p_http():
+    """通用 HTTP provider：任意返回 JSON 的接口都能当设备名来源
+
+    支持两种返回：
+      [{"ip": "1.2.3.4", "name": "abc"}, ...]
+      {"1.2.3.4": "abc", ...}
+    """
+    if not DEV_HTTP_URL:
+        return None
+    import urllib.request
+    req = urllib.request.Request(DEV_HTTP_URL, headers={
+        "User-Agent": "mosdns-dashboard",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=DEV_HTTP_TIMEOUT) as r:
+        j = json.loads(r.read().decode("utf-8", "replace") or "null")
+    names = {}
+    if isinstance(j, dict):
+        for k, v in j.items():
+            if isinstance(v, str) and v:
+                names[k] = v
+            elif isinstance(v, dict):
+                nm = (v.get("name") or v.get("hostname") or "").strip()
+                ip = v.get("ip") or k
+                if ip and nm:
+                    names[ip] = nm
+    elif isinstance(j, list):
+        for it in j:
+            if not isinstance(it, dict):
+                continue
+            ip = (it.get("ip") or it.get("client") or "").strip()
+            nm = (it.get("name") or it.get("hostname") or "").strip()
+            if ip and nm:
+                names[ip] = nm
+    return {"names": names, "macs": {}, "hosts": {}}
+
+
+# provider 注册表：顺序即优先级（**后注册的覆盖先注册的**）
+# 所以把手动配置放最后（最高优先），ARP 放最前（最低优先）。
+DEVICE_PROVIDER_FUNCS = [
+    ("arp", _p_arp),
+    ("dnsmasq", _p_dnsmasq),
+    ("agh", _p_agh),
+    ("ikuai", _p_ikuai),
+    ("http", _p_http),
+    ("manual", _p_manual),
+]
+
+
+def _resolve_providers():
+    """算出实际要用的 provider 列表"""
+    if DEVICE_PROVIDERS.lower() == "auto":
+        return list(DEVICE_PROVIDER_FUNCS)
+    want = [x.strip().lower() for x in DEVICE_PROVIDERS.split(",") if x.strip()]
+    known = {n for n, _ in DEVICE_PROVIDER_FUNCS}
+    unknown = [x for x in want if x not in known]
+    if unknown:
+        sys.stderr.write("[providers] 未知 provider: %s（可用: %s）\n"
+                         % (", ".join(unknown), ", ".join(sorted(known))))
+    # 显式指定时按用户给的顺序（先给的优先级低，后给的高）
+    return [(n, f) for n, f in DEVICE_PROVIDER_FUNCS if n in want]
+
+
+def device_providers():
+    """采集所有可用 provider 的设备信息，按优先级合并
+
+    合并规则：低优先级先写，高优先级后写并覆盖 ——
+    所以 manual 在最后，它的结果最权威。
+    """
+    merged = {"names": {}, "macs": {}, "hosts": {}}
+    used = []
+    for name, fn in _resolve_providers():
+        d = _provider_result(name, fn)
+        if not d:
+            continue
+        used.append(name)
+        for k in ("names", "macs", "hosts"):
+            merged[k].update(d.get(k) or {})
+    merged["sources"] = used
+    return merged
+
+
+def dev_names():
+    """设备名（多数据源合并后的结果）"""
+    return device_providers()["names"]
+
+
+def dev_macs():
+    """设备 MAC（多数据源合并后的结果）"""
+    return device_providers()["macs"]
+
+
 # ---------- 爱快（iKuai）----------
 # 爱快的 Web 管理界面本身就是一套 JSON API：
 #   POST /Action/login  {"username","passwd"(md5),"pass"(base64)} -> sess_key
@@ -1242,17 +1771,6 @@ def ik_names(force=False):
     return _ik["names"]
 
 
-def dev_names():
-    """设备名优先级：手动 devices.conf > 爱快 DHCP hostname"""
-    names = {}
-    try:
-        names.update(ik_names())
-    except Exception:
-        pass
-    names.update(load_devices())
-    return names
-
-
 def agh_login(force=False):
     """拿/续 cookie，30 分钟有效，提前 2 分钟换新的"""
     if not force and _agh["cookie"] and time.time() - _agh["ts"] < 1740:
@@ -1262,19 +1780,19 @@ def agh_login(force=False):
         _agh["err"] = "未配置 agh.conf"
         return False
     url = cfg["AGH_URL"].rstrip("/") + "/control/login"
-    body = json.dumps({"name": cfg.get("AGH_USER", ""),
-                       "password": cfg.get("AGH_PASS", "")})
-    cmd = ('curl -sk --noproxy "*" -m 8 -X POST "%s" '
-           '-H "Content-Type: application/json" '
-           "-D /tmp/agh-h.txt -o /tmp/agh-b.txt -d '%s'; "
-           "echo '@@@'; sed -n 's/^[Ss]et-[Cc]ookie: \\([^;]*\\).*/\\1/p' /tmp/agh-h.txt; "
-           "rm -f /tmp/agh-h.txt /tmp/agh-b.txt" % (url, body))
-    out, err = ssh(cmd, 20)
-    if err:
-        _agh["err"] = "ssh: %s" % err
+    code, body, hdrs = http_post_json(
+        url, {"name": cfg.get("AGH_USER", ""),
+              "password": cfg.get("AGH_PASS", "")}, timeout=8)
+    if code is None:
+        _agh["err"] = "请求失败: %s" % (body or "")
         return False
-    parts = (out or "").split("@@@")
-    cookie = (parts[1].strip() if len(parts) > 1 else "")
+    if code not in (200, 204):
+        _agh["err"] = "登录失败 HTTP %s（检查 agh.conf 里的账号密码）" % code
+        _agh["ok"] = False
+        return False
+    # Set-Cookie 可能有多个，取第一个；按分号切出 name=value
+    raw = hdrs.get("Set-Cookie") or hdrs.get("set-cookie") or ""
+    cookie = raw.split(";", 1)[0].strip()
     if not cookie:
         _agh["err"] = "登录失败（返回中无 cookie，检查 agh.conf 里的密码）"
         _agh["ok"] = False
@@ -1292,20 +1810,17 @@ def agh_get(path, timeout=20, retry=True):
         return None
     cfg = agh_conf()
     url = cfg["AGH_URL"].rstrip("/") + path
-    cmd = ('curl -sk --noproxy "*" -m 15 -w "\\n@@@HTTP%%{http_code}" -H "%s" "%s"'
-           % ("Cookie: " + _agh["cookie"], url))
-    out, err = ssh(cmd, timeout)
-    if err:
-        _agh["err"] = "ssh: %s" % err
+    code, body = http_get(url, timeout=timeout,
+                          headers={"Cookie": _agh["cookie"]})
+    if code is None:
+        _agh["err"] = "请求失败: %s" % (body or "")
         return None
-    body, _, code = (out or "").rpartition("@@@HTTP")
-    code = code.strip()
-    if code in ("401", "403") and retry:
+    if code in (401, 403) and retry:
         _agh["cookie"] = ""
         if agh_login(force=True):
             return agh_get(path, timeout, retry=False)
         return None
-    if code != "200":
+    if code != 200:
         _agh["err"] = "HTTP %s" % code
         return None
     try:
@@ -1333,18 +1848,115 @@ def agh_clients():
     return agh_get("/control/stats_top?limit=100")
 
 
-def read_macs():
-    """从路由器的邻居表取 IP→MAC（只读命令，不动任何配置）
-    注意 BusyBox 的 ip neigh 输出格式是：
-      192.168.1.40 lladdr 8c:d0:b2:b0:36:c4 STALE
-    中间夹着 "lladdr"，所以 MAC 在**第 3 列**，不是第 5 列。
-    在 Python 侧解析，不用 awk（省一层 shell 转义麻烦）。"""
-    out, _ = ssh("ip neigh show dev br-lan 2>/dev/null", 15)
+_iface_cache = {"name": "", "ts": 0.0}
+
+
+def detect_lan_iface():
+    """探测局域网接口名
+
+    写死 br-lan 的坑：x86 软路由、VLAN 划分、爱快做主路由、
+    无线网卡当 LAN 口 —— 这些场景下都不叫 br-lan，直接导致 MAC 全空。
+
+    判定顺序：
+      1. LAN_IFACE 显式指定（最高优先）
+      2. 默认路由所在的接口（最可靠：能出网的口就是 LAN 口）
+      3. 候选列表里挑邻居数最多的
+    """
+    if LAN_IFACE:
+        return LAN_IFACE
+    now = time.time()
+    if _iface_cache["name"] and now - _iface_cache["ts"] < 300:
+        return _iface_cache["name"]
+
+    name = ""
+    # 2. 默认路由所在接口
+    out, _ = run_cmd("ip route show default 2>/dev/null", 10)
+    for line in (out or "").splitlines():
+        if " dev " in line:
+            name = line.split(" dev ", 1)[1].split()[0]
+            break
+    # 3. 候选里挑邻居最多的
+    if not name:
+        best, best_n = "", -1
+        for cand in LAN_IFACE_CANDIDATES:
+            o, _ = run_cmd("ip neigh show dev %s 2>/dev/null" % shlex.quote(cand), 10)
+            n = len([x for x in (o or "").splitlines() if x.strip()])
+            if n > best_n:
+                best, best_n = cand, n
+        name = best
+
+    if name:
+        _iface_cache["name"] = name
+        _iface_cache["ts"] = now
+    return name
+
+
+def _parse_neigh_lines(out):
+    """解析 `ip neigh` 输出 → {ip: mac}
+
+    两种格式都要吃：
+      iproute2 : 192.168.1.40 dev br-lan lladdr 8c:d0:b2:b0:36:c4 STALE
+      BusyBox   : 192.168.1.40 lladdr 8c:d0:b2:b0:36:c4 STALE
+    BusyBox 的输出里没有 "dev"，MAC 在第 3 列而不是第 5 列 ——
+    早先只按第 5 列解析，在 BusyBox 上会全空。
+    """
     macs = {}
     for line in (out or "").splitlines():
         p = line.split()
-        if len(p) >= 3 and p[1] == "lladdr" and ":" in p[2]:
-            macs[p[0]] = p[2].lower()
+        if "lladdr" in p:
+            i = p.index("lladdr")
+            if i + 1 < len(p) and ":" in p[i + 1]:
+                macs[p[0]] = p[i + 1].lower()
+    return macs
+
+
+def _read_arp_proc():
+    """Linux 下兜底：直接读 /proc/net/arp（不依赖 ip 命令）"""
+    macs = {}
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8", errors="replace") as f:
+            next(f, None)  # 表头
+            for line in f:
+                p = line.split()
+                if len(p) >= 4 and ":" in p[3] and p[3] != "00:00:00:00:00:00":
+                    macs[p[0]] = p[3].lower()
+    except Exception:
+        pass
+    return macs
+
+
+def read_macs():
+    """取 IP→MAC 映射（只读，不动任何配置）
+
+    多来源依次尝试，任一成功即用：
+      1. ip neigh show dev <自动探测的接口>
+      2. ip neigh show（不限接口，滤掉 IPv6 链路本地）
+      3. /proc/net/arp（没有 ip 命令时）
+      4. arp -a（Windows / macOS 本地部署）
+    """
+    # 1. 指定/探测到的接口
+    iface = detect_lan_iface()
+    if iface:
+        out, _ = run_cmd("ip neigh show dev %s 2>/dev/null" % shlex.quote(iface), 15)
+        macs = _parse_neigh_lines(out)
+        if macs:
+            return macs
+    # 2. 不限接口
+    out, _ = run_cmd("ip neigh show 2>/dev/null", 15)
+    macs = _parse_neigh_lines(out)
+    if macs:
+        return macs
+    # 3. /proc/net/arp
+    macs = _read_arp_proc()
+    if macs:
+        return macs
+    # 4. arp -a（本地部署在 Windows/macOS 上时）
+    out, _ = run_cmd("arp -a 2>/dev/null", 10)
+    macs = {}
+    for line in (out or "").splitlines():
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{11,17})", line)
+        if m:
+            macs[m.group(1)] = m.group(2).lower().replace("-", ":")
     return macs
 
 
@@ -1485,7 +2097,7 @@ def collector_loop():
 # ---------- 面板基线（只影响本面板显示，绝不动路由器上的 MosDNS） ----------
 # 原理：点「清除」时把此刻的累计值记为基线，之后展示 当前值 - 基线值，
 # 相当于从那一刻重新开始计数。MosDNS 里的真实统计完全不被修改。
-BASELINE_FILE = os.path.join(HERE, "baseline.json")
+BASELINE_FILE = os.path.join(DATA_DIR, "baseline.json")
 _baseline = None
 _b_lock = threading.Lock()
 
@@ -1643,29 +2255,124 @@ def get_snapshot(force=False):
 
 
 # ---------- 实时查询 ----------
+def _dns_encode_name(name):
+    """把域名编码成 DNS 报文里的 label 序列"""
+    out = b""
+    for label in name.rstrip(".").split("."):
+        if label:
+            out += bytes([len(label)]) + label.encode("utf-8")
+    return out + b"\x00"
+
+
+def _dns_skip_name(data, off):
+    """跳过报文中可能带压缩指针的域名，返回新的偏移"""
+    while off < len(data):
+        n = data[off]
+        if n == 0:
+            return off + 1
+        if n & 0xC0 == 0xC0:          # 压缩指针：14 位偏移
+            return off + 2
+        off += 1 + n
+    return off
+
+
+def _dns_decode_name(data, off):
+    """解出域名（处理压缩指针）"""
+    parts, jumped, seen = [], False, 0
+    pos = off
+    while seen < 64:                    # 防指针环
+        seen += 1
+        if pos >= len(data):
+            break
+        n = data[pos]
+        if n == 0:
+            pos += 1
+            if not jumped:
+                off = pos
+            break
+        if n & 0xC0 == 0xC0:
+            ptr = ((n & 0x3F) << 8) | data[pos + 1]
+            if not jumped:
+                off = pos + 2
+            jumped = True
+            pos = ptr
+            continue
+        parts.append(data[pos + 1:pos + 1 + n].decode("utf-8", "replace"))
+        pos += 1 + n
+    return ".".join(parts), off
+
+
+def _dns_query(host, port, name, qtype, timeout=3.0):
+    """用 UDP 直接发一条 DNS 查询，返回 [(类型, 值), ...]
+
+    为什么不用 dig：精简系统（OpenWrt / Alpine / 多数 Docker 镜像）
+    默认不带 dig，而这是面板唯一需要的 DNS 客户端能力。
+    用标准库手写一个最小实现，就少一个外部依赖。
+    """
+    try:
+        tid = secrets.randbelow(65536)
+        header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        q = header + _dns_encode_name(name) + struct.pack(">HH", qtype, 1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(q, (host, port))
+            data, _ = s.recvfrom(4096)
+        if len(data) < 12:
+            return []
+        ancount = struct.unpack(">H", data[6:8])[0]
+        off = _dns_skip_name(data, 12)
+        off += 4                                # 跳过 question 的 type/class
+        out = []
+        for _ in range(ancount):
+            _nm, off = _dns_decode_name(data, off)
+            if off + 10 > len(data):
+                break
+            rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if off + rdlen > len(data):
+                break
+            if rtype == 1 and rdlen == 4:                       # A
+                out.append(("A", socket.inet_ntoa(data[off:off + 4])))
+            elif rtype == 28 and rdlen == 16:                   # AAAA
+                out.append(("AAAA", socket.inet_ntop(socket.AF_INET6,
+                                               data[off:off + 16])))
+            elif rtype == 5:                                    # CNAME
+                val, _ = _dns_decode_name(data, off)
+                out.append(("CNAME", val.rstrip(".")))
+            off += rdlen
+        return out
+    except Exception:
+        return []
+
+
 def query(name):
     t0 = time.time()
-    nm = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())[:路由器]
+    nm = re.sub(r"[^A-Za-z0-9._-]", "", (name or "").strip())[:253]
     if not nm:
         return {"ok": False, "error": "名称为空或不合法"}
 
-    dig = ('dig @127.0.0.1 -p %d +noall +answer +time=3 +tries=1 %s A; '
-           'dig @127.0.0.1 -p %d +noall +answer +time=3 +tries=1 %s AAAA'
-           % (MOSDNS_PORT, nm, MOSDNS_PORT, nm))
-    out, err = ssh(dig, 25)
-
+    # 优先用 Python 原生查询（不依赖 dig）；全空时回退到 dig
     answers, seen = [], set()
-    for line in (out or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith(";"):
-            continue
-        p = line.split()
-        if len(p) >= 5 and p[3] in ("A", "AAAA", "CNAME"):
-            v = p[4].rstrip(".")
-            k = (p[3], v)
-            if k not in seen:
-                seen.add(k)
-                answers.append({"type": p[3], "value": v})
+    host = "127.0.0.1" if transport_mode() == "local" else MOSDNS_HOST
+    for qtype, code in (("A", 1), ("AAAA", 28)):
+        for t, v in _dns_query(host, MOSDNS_PORT, nm, qtype):
+            if (t, v) not in seen:
+                seen.add((t, v))
+                answers.append({"type": t, "value": v})
+
+    if not answers and transport_mode() != "local":
+        # 远端兜底：有些环境 MosDNS 只监听特定地址，本机直连不通
+        dig = ('dig @%s -p %d +noall +answer +time=3 +tries=1 %s A; '
+               'dig @%s -p %d +noall +answer +time=3 +tries=1 %s AAAA'
+               % (MOSDNS_HOST, MOSDNS_PORT, nm, MOSDNS_HOST, MOSDNS_PORT, nm))
+        out, _ = run_cmd(dig, 25)
+        for line in (out or "").splitlines():
+            p = line.strip().split()
+            if len(p) >= 5 and p[3] in ("A", "AAAA", "CNAME"):
+                v = p[4].rstrip(".")
+                if (p[3], v) not in seen:
+                    seen.add((p[3], v))
+                    answers.append({"type": p[3], "value": v})
 
     # 从 MosDNS 日志里找这次查询的处理链路（A / AAAA 分别取最新一条）
     handling = {}
@@ -1692,15 +2399,17 @@ def query(name):
         "answers": answers,
         "mosdns": handling.get("A") or handling.get("AAAA"),
         "handling": handling,
-        "via": "%s:%d" % (MOSDNS_HOST, MOSDNS_PORT),
+        "via": "%s:%d" % (host, MOSDNS_PORT),
+        "transport": transport_mode(),
         "took_ms": int((time.time() - t0) * 1000),
-        "error": err,
     }
 
 
 def _jload_pull_logs():
-    out, _ = ssh('curl -s --noproxy "*" -m 10 "%s/logs"' % STATS_API, 20)
-    j = _jload(out)
+    code, body = http_get(STATS_API + "/logs", timeout=10)
+    if code != 200:
+        return []
+    j = _jload(body)
     return (j or {}).get("items") or []
 
 
@@ -1962,7 +2671,11 @@ class Handler(BaseHTTPRequestHandler):
         if not cfg:
             return False
         p = (urlparse(self.path).path.rstrip("/")) or "/"
-        if p in ("/login.html", "/api/login") or p.startswith("/static/login"):
+        # 探针与指标不需要登录态：k8s/Docker 探针带不了 cookie，
+        # 若被拦成 401，健康检查就永远失败（等于没有）。
+        # /metrics 只暴露聚合数字、不含客户端身份，可以放行。
+        if (p in ("/login.html", "/api/login", "/healthz", "/metrics")
+                or p.startswith("/static/login")):
             return False
         if self._sess_user():
             return False
@@ -2287,6 +3000,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, json.dumps({"ok": False, "error": str(e)},
                                                   ensure_ascii=False))
 
+        if p == "/api/providers":
+            """设备数据源自检：哪些 provider 启用了、各自拿到多少数据"""
+            try:
+                info = device_providers()
+                detail = []
+                for name, _fn in _resolve_providers():
+                    d = _provider_result(name, _fn) or {}
+                    detail.append({
+                        "name": name,
+                        "names": len(d.get("names") or {}),
+                        "macs": len(d.get("macs") or {}),
+                    })
+                return self._send(200, json.dumps({
+                    "ok": True,
+                    "config": DEVICE_PROVIDERS,
+                    "active": info.get("sources") or [],
+                    "providers": detail,
+                    "total": {"names": len(info["names"]),
+                              "macs": len(info["macs"]),
+                              "hosts": len(info["hosts"])},
+                }, ensure_ascii=False))
+            except Exception as e:
+                return self._send(500, json.dumps({"ok": False, "error": str(e)},
+                                                  ensure_ascii=False))
+
         if p == "/api/ikuai":
             """爱快对接自检：强制重新登录并拉一次 DHCP 租约表"""
             try:
@@ -2359,6 +3097,118 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(500, json.dumps({"ok": False, "error": str(e)},
                                                   ensure_ascii=False))
+
+        if p == "/healthz":
+            """健康/就绪探针：返回各组件状态
+
+            🔴 判定分两层，不能混为一谈：
+               - required：数据库、磁盘 —— 挂了服务就真的不可用
+               - optional：AGH、iKuai —— 这两个是**可选**集成，
+                 没配 agh.conf / iKuai.conf 的部署本来就不该有它们。
+                 旧实现把 optional 也算进 all()，导致只装 MosDNS 的
+                 正常部署永远返回 503，探针形同虚设。
+            """
+            checks = {}
+            # --- 必需：数据库 ---
+            try:
+                c = db()
+                with _db_lock:
+                    c.execute("SELECT 1").fetchone()
+                checks["database"] = True
+            except Exception:
+                checks["database"] = False
+            # --- 必需：磁盘 ---
+            try:
+                import shutil
+                checks["disk"] = shutil.disk_usage(HERE).free > 100 * 1024 * 1024
+            except Exception:
+                checks["disk"] = False
+            # --- 数据链路：取数通道 + MosDNS（不可用时服务降级但不崩溃）---
+            # ⚠️ 判定要跟着 TRANSPORT 走：local 模式下没有 SSH，
+            #    判 "ssh": false 会让健康检查永远 degraded。
+            mode = transport_mode()
+            if mode == "local":
+                checks["transport"] = "local"
+                checks["ssh"] = None      # 该模式不用 SSH，不参与判定
+            else:
+                ok_ssh, _why = ssh_available()
+                checks["transport"] = "ssh"
+                checks["ssh"] = ok_ssh
+            try:
+                code, body = http_get(STATS_API + "/stats", timeout=3)
+                checks["mosdns"] = bool(code == 200 and body
+                                        and len(body) > 10)
+            except Exception:
+                checks["mosdns"] = False
+            # --- 可选集成：没配就是 None（未启用），配了但连不上才是 False ---
+            # ⚠️ 判据必须是「配置文件是否存在」，不能用 conf 里的 URL 是否为空：
+            #    ik_conf() 硬编码了默认 IKUAI_URL=https://192.168.1.1，
+            #    没配 ikuai.conf 时它照样返回一个 URL，会把「未启用」误判成「连不上」。
+            checks["agh"] = (None if not os.path.exists(AGH_CONF)
+                             else bool(_agh.get("ok")))
+            checks["ikuai"] = (None if not os.path.exists(IK_CONF)
+                              else bool(_ik.get("ok")))
+
+            required_ok = checks["database"] and checks["disk"]
+            # ssh 为 None 表示当前模式不用 SSH（local），不参与判定
+            ssh_ok = checks["ssh"] is not False
+            data_ok = ssh_ok and checks["mosdns"]
+            optional_bad = any(v is False for v in checks.values())
+
+            # 就绪：服务本身可用（DB + 磁盘）；数据链路断开时仍算 live 但不算 ready
+            code = 200 if required_ok else 503
+            status = "ok" if (required_ok and data_ok and not optional_bad) else (
+                "degraded" if required_ok else "error")
+            return self._send(code, json.dumps({
+                "status": status,
+                "ready": bool(required_ok),
+                "checks": checks,
+                "uptime_s": int(time.time() - START_TS),
+            }, ensure_ascii=False))
+
+        if p == "/metrics":
+            """Prometheus 指标端点：供 Grafana/Prometheus 采集
+
+            ⚠️ 这里**必须**用缓存快照，不能 force=True：
+               Prometheus 默认 15~30s 抓一次，而 collect() 会发起 4 次 SSH。
+               强制采集等于把路由器的 SSH 负载翻一倍，且抓取耗时长时会堆积。
+               后台 push_loop 已有 2s 一轮的采集，缓存足够新鲜。"""
+            try:
+                data = get_snapshot()
+                s = data.get("stats") or {}
+                out = []
+                out.append("# HELP mosdns_queries_total Total DNS queries")
+                out.append("# TYPE mosdns_queries_total counter")
+                out.append("mosdns_queries_total %s" % (s.get("total_queries") or 0))
+                out.append("# HELP mosdns_cache_hits_total Total cache hits")
+                out.append("# TYPE mosdns_cache_hits_total counter")
+                out.append("mosdns_cache_hits_total %s" % (s.get("cached_queries") or 0))
+                out.append("# HELP mosdns_blocked_total Total blocked queries")
+                out.append("# TYPE mosdns_blocked_total counter")
+                out.append("mosdns_blocked_total %s" % (s.get("blocked_queries") or 0))
+                out.append("# HELP mosdns_cache_size Current cache entries")
+                out.append("# TYPE mosdns_cache_size gauge")
+                out.append("mosdns_cache_size %s" % (data.get("cache_size") or 0))
+                out.append("# HELP mosdns_uptime_seconds Uptime in seconds")
+                out.append("# TYPE mosdns_uptime_seconds gauge")
+                out.append("mosdns_uptime_seconds %d" % int(time.time() - START_TS))
+                out.append("# HELP mosdns_upstream_queries_total Upstream queries")
+                out.append("# TYPE mosdns_upstream_queries_total counter")
+                out.append("# HELP mosdns_upstream_latency_ms Upstream average latency")
+                out.append("# TYPE mosdns_upstream_latency_ms gauge")
+                # HELP/TYPE 每个指标族只出一次；标签值要转义，
+                # 否则 upstream 里带引号/反斜杠会破坏 exposition 格式。
+                for r in ((data.get("upstreams") or {}).get("rows") or []):
+                    label = _prom_label(r.get("addr") or "")
+                    out.append("mosdns_upstream_queries_total{upstream=\"%s\"} %s"
+                               % (label, r.get("c") or 0))
+                    if r.get("ms") is not None:
+                        out.append("mosdns_upstream_latency_ms{upstream=\"%s\"} %.2f"
+                                   % (label, r.get("ms")))
+                return self._send(200, "\n".join(out) + "\n",
+                                  "text/plain; version=0.0.4")
+            except Exception as e:
+                return self._send(500, "# ERROR: %s\n" % e, "text/plain")
 
         if p == "/health":
             conn = db()
@@ -2473,12 +3323,17 @@ class MuxHTTPServer(ThreadingHTTPServer):
             except Exception:
                 self._close(sock)
                 raise
-        # 明文：换成能挂标记的子类（detach 把 fd 交给它，原对象不再拥有这个 fd）
+        # 明文连接：换成能挂标记的子类（detach 把 fd 交给它，原对象不再拥有这个 fd）
         try:
             # 先取再 detach —— detach 之后原对象的 family/type/proto 不保证还能读
             fam, typ, pro = sock.family, sock.type, sock.proto
             plain = _PlainSocket(fam, typ, pro, fileno=sock.detach())
-            plain.plain_http = True
+            # 🔴 只有真的启用了 TLS 才标记成"待重定向"。
+            #    没配证书时 ssl_ctx is None，此时服务就是明文 HTTP，
+            #    若仍打标记，_redirect_plain_http 会 301 跳到 https:// ——
+            #    而服务器根本不会 TLS，浏览器只会拿到无限重定向 /
+            #    ERR_TOO_MANY_REDIRECTS，整个面板变得不可访问。
+            plain.plain_http = self.ssl_ctx is not None
             return plain, addr
         except Exception:
             return sock, addr
@@ -2492,6 +3347,50 @@ class MuxHTTPServer(ThreadingHTTPServer):
 
 
 def main():
+    # 启动前安全检查
+    auth = auth_cfg()
+    if not auth:
+        if LISTEN_HOST == "0.0.0.0":
+            sys.stderr.write("⚠️  警告：监听 0.0.0.0 但未启用认证，面板将对公网开放！\n")
+            sys.stderr.write("   建议：\n")
+            sys.stderr.write("   1. 运行 tools/dashboard-setpass 设置密码\n")
+            sys.stderr.write("   2. 或修改 DASH_HOST=127.0.0.1 只监听本地\n")
+            sys.stderr.write("   3. 继续启动请等待 3 秒...\n")
+            time.sleep(3)
+        else:
+            sys.stderr.write("⚠️  未启用认证，仅监听 %s\n" % LISTEN_HOST)
+
+    # 检查取数通道
+    mode = transport_mode()
+    sys.stderr.write("取数方式: %s" % mode)
+    if mode == "local":
+        found = next((p for p in MOSDNS_CFG_CANDIDATES if os.path.exists(p)), "")
+        if found:
+            sys.stderr.write("（MosDNS 配置: %s）\n" % found)
+        else:
+            sys.stderr.write("  ⚠️ 未找到 MosDNS 配置文件，候选: %s\n"
+                             % ", ".join(MOSDNS_CFG_CANDIDATES))
+    else:
+        sys.stderr.write("（%s@%s:%d，key %s）\n"
+                         % (MOSDNS_USER, MOSDNS_HOST, SSH_PORT, SSH_KEY))
+        try:
+            ok, why = ssh_available()
+            if not ok:
+                sys.stderr.write("⚠️  SSH 连接失败: %s\n" % why)
+                sys.stderr.write("   请检查 MOSDNS_HOST / MOSDNS_SSH_PORT / "
+                                 "MOSDNS_SSH_KEY，或改用 MOSDNS_TRANSPORT=local\n")
+        except Exception as e:
+            sys.stderr.write("⚠️  SSH 检查异常: %s\n" % e)
+
+    # 检查数据库
+    try:
+        c = db()
+        with _db_lock:
+            c.execute("SELECT 1").fetchone()
+        sys.stderr.write("✓ 数据库已就绪（WAL 模式）\n")
+    except Exception as e:
+        sys.stderr.write("⚠️  数据库初始化失败: %s\n" % e)
+
     # 先攒一批日志，再启动 HTTP；后台线程持续累积
     try:
         n, err = ingest()
@@ -2511,7 +3410,7 @@ def main():
         sys.stderr.write("已启用 HTTPS(TLS>=1.2)，证书 %s；明文 http 请求将 301 跳到 https\n"
                          % TLS_CERT)
     else:
-        sys.stderr.write("未找到 TLS 证书，回退为明文 HTTP\n")
+        sys.stderr.write("⚠️  未找到 TLS 证书，回退为明文 HTTP（建议配置证书）\n")
     sys.stderr.write("MosDNS Dashboard 监听 %s:%d  数据源 %s  日志保留 %d 条\n"
                      % (LISTEN_HOST, LISTEN_PORT, MOSDNS_HOST, LOG_KEEP))
     try:

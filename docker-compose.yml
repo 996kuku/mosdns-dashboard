@@ -1,0 +1,63 @@
+# MosDNS 仪表盘 —— Docker Compose 部署示例
+#
+# 数据持久化：容器把数据库和配置写在 DATA_DIR（镜像里是 /app/data），
+# 挂成 named volume，重建镜像不会丢历史数据。
+#
+# 两种典型用法：
+#
+# A. MosDNS 也在宿主机/同网络（推荐，最省资源）
+#    local 模式直接请求 MosDNS API，不需要 SSH。
+#    上游清单要读 MosDNS 配置文件，把文件挂进容器即可。
+#
+# B. MosDNS 在远端路由器上
+#    改成 MOSDNS_TRANSPORT=ssh，挂上 SSH 私钥。
+
+services:
+  mosdns-dashboard:
+    build: .
+    image: mosdns-dashboard:latest
+    container_name: mosdns-dashboard
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      # --- 取数方式 ---
+      MOSDNS_TRANSPORT: local
+      # 容器内访问宿主机的 MosDNS API
+      MOSDNS_API_ADDR: host.docker.internal:9091
+      # MosDNS 配置文件（读上游清单用），挂载点见下方 volumes
+      MOSDNS_CFG_PATH: /app/data/mosdns.json
+      MOSDNS_PORT: "5335"
+
+      # --- 设备数据源 ---
+      # auto = 启用所有探测到的（ARP / dnsmasq / AGH / iKuai / HTTP / 手动）
+      DEVICE_PROVIDERS: auto
+      # 非 br-lan 的环境在这里指定网口（不填则自动探测）
+      # LAN_IFACE: br-lan
+
+      # --- 可选集成（配了才会启用）---
+      # AGH_URL: http://192.168.1.1:8080
+      # AGH_USER: admin
+      # AGH_PASS: ""
+      # 爱快：IKUAI_URL / IKUAI_USER / IKUAI_PASS
+
+      # --- 采集频率 ---
+      INGEST_INTERVAL: "5"
+      PUSH_INTERVAL: "2"
+      PUSH_IDLE_INTERVAL: "10"
+    volumes:
+      # 数据库 + 配置持久化（named volume，Docker 自动管理）
+      - dashboard-data:/app/data
+      # MosDNS 配置文件（读上游清单）。按你的实际路径改
+      - /etc/mosdns/mosdns.json:/app/data/mosdns.json:ro
+      # 已有配置也可以放进去（先拷贝到 ./data 再挂）
+      # - ./data/auth.conf:/app/data/auth.conf:ro
+      # - ./data/agh.conf:/app/data/agh.conf:ro
+      # - ./data/devices.conf:/app/data/devices.conf:ro
+      # SSH 模式：改 MOSDNS_TRANSPORT=ssh 并挂私钥
+      # - ./data/id_ed25519_mosdns:/app/data/id_ed25519_mosdns:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  dashboard-data:

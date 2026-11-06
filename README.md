@@ -52,6 +52,9 @@
 - **8088 单端口同时收 HTTPS 和 HTTP**：明文请求自动 301 跳 HTTPS（accept 后 peek 首字节判断，和 nginx 的 `ssl_preread` 一个思路）
 - **登录认证**：PBKDF2 存密码，cookie 用 HMAC-SHA256 签名（HttpOnly / SameSite=Lax / Secure）
 - **零依赖**：只用 Python 标准库
+- **数据库优化**：WAL 模式、增量采集、自动清理，支持高并发
+- **健康检查**：`/healthz` 端点，适合 Docker/K8s 监控
+- **Prometheus 指标**：`/metrics` 端点，可对接 Grafana
 
 ---
 
@@ -85,25 +88,37 @@
 
 ## 安装
 
+**方式 A：MosDNS 与面板同机（推荐，最省资源）**
+
 ```bash
-# 1. 放代码
 git clone <你的仓库地址> /opt/mosdns-dashboard
 cd /opt/mosdns-dashboard
 
-# 2. 建配置（四个 .example 复制过去即可，AGH / iKuai / devices 不配也能跑）
+cp auth.conf.example auth.conf && chmod 600 auth.conf
+./tools/dashboard-setpass
+
+# 不需要 SSH key —— 直接读本机的 MosDNS 配置
+MOSDNS_TRANSPORT=local ./server.py
+```
+
+**方式 B：面板在另一台机器，通过 SSH 取数（现有方式）**
+
+```bash
+git clone <你的仓库地址> /opt/mosdns-dashboard
+cd /opt/mosdns-dashboard
+
 cp auth.conf.example    auth.conf    && chmod 600 auth.conf
 cp agh.conf.example     agh.conf     && chmod 600 agh.conf      # 可选
 cp ikuai.conf.example   ikuai.conf   && chmod 600 ikuai.conf    # 可选
 cp devices.conf.example devices.conf                            # 可选
 
-# 3. 设登录密码（会写入 auth.conf 的 AUTH_HASH / AUTH_SECRET）
 ./tools/dashboard-setpass
 
-# 4. SSH key（面板要用它连路由器）
-ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519_mosdns -N ''
-ssh-copy-id -i /root/.ssh/id_ed25519_mosdns root@<路由器IP>
+# SSH key（面板要用它连路由器）
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_mosdns -N ''
+ssh-copy-id -i ~/.ssh/id_ed25519_mosdns root@<路由器IP>
 
-# 5. 装服务
+# 装服务
 cp deploy/mosdns-dashboard.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now mosdns-dashboard
@@ -121,15 +136,115 @@ systemctl enable --now mosdns-dashboard
 |---|---|---|
 | `DASH_HOST` | `0.0.0.0` | 监听地址 |
 | `DASH_PORT` | `8088` | 监听端口 |
-| `DASH_TLS_CERT` | `/opt/mosdns-dashboard/ssl/server.pem` | TLS 证书链 |
-| `DASH_TLS_KEY` | `/opt/mosdns-dashboard/ssl/server.key` | TLS 私钥 |
-| `MOSDNS_HOST` | `192.168.1.1` | 路由器 IP |
-| `MOSDNS_USER` | `root` | SSH 用户名 |
-| `MOSDNS_SSH_KEY` | `/root/.ssh/id_ed25519_mosdns` | SSH 私钥路径 |
+| `DASH_TLS_CERT` | `<安装目录>/ssl/server.pem` | TLS 证书链 |
+| `DASH_TLS_KEY` | `<安装目录>/ssl/server.key` | TLS 私钥 |
+| `MOSDNS_TRANSPORT` | `auto` | 取数方式：`auto` / `local` / `ssh` |
+| `MOSDNS_HOST` | `192.168.1.1` | 路由器 IP（ssh 模式） |
+| `MOSDNS_USER` | `root` | SSH 用户名（ssh 模式） |
+| `MOSDNS_SSH_PORT` | `22` | SSH 端口（ssh 模式） |
+| `MOSDNS_SSH_KEY` | `~/.ssh/id_ed25519_mosdns` | SSH 私钥路径（ssh 模式） |
+| `MOSDNS_API_ADDR` | `127.0.0.1:9091` | MosDNS API 地址 |
+| `MOSDNS_API_PATH` | `/plugins/stats_collector/api/v1` | MosDNS API 路径 |
+| `MOSDNS_PORT` | `5335` | MosDNS DNS 端口（实时查询用） |
+| `MOSDNS_CFG_PATH` | 自动探测 | MosDNS 配置文件路径 |
+| `LAN_IFACE` | 自动探测 | 局域网接口名（取 MAC 用） |
 | `INGEST_INTERVAL` | `5` | 采集间隔（秒） |
 | `PUSH_INTERVAL` | `2` | 有人在看时的 SSE 采样间隔（秒） |
 | `PUSH_IDLE_INTERVAL` | `10` | 没人看时的采样间隔（秒） |
 | `UP_CFG_TTL` | `60` | 上游清单配置缓存（秒） |
+
+### 取数方式（MOSDNS_TRANSPORT）
+
+| 值 | 适用场景 |
+|---|---|
+| `auto` | 本机有 MosDNS 配置文件就直接读，否则走 SSH（默认，兼容老部署） |
+| `local` | MosDNS 与面板同机、Docker 部署 —— 不需要 SSH，纯 Python 读配置 |
+| `ssh` | 面板在另一台机器，通过 SSH 到路由器取数（现有行为） |
+
+`local` 模式下**不依赖** `ssh` / `curl` / `dig` / `base64`，只需要 Python 标准库。所有 HTTP 请求走 `urllib`，DNS 查询是手写的 DNS 报文实现。
+
+> AGH 和爱快都用自签证书，`local` 模式下默认不校验证书（`DASH_STRICT_TLS=1` 可开启校验）。
+
+### 设备数据源（可插拔）
+
+设备名 / MAC 的来源不止爱快一种。面板按优先级依次启用所有可用的数据源：
+
+| 顺序 | provider | 数据来源 | 需要配置 |
+|---|---|---|---|
+| 1 | `arp` | ARP / 邻居表（自动探测接口） | 无，总是可用 |
+| 2 | `dnsmasq` | dnsmasq 租约文件 | 无，OpenWrt 白送 |
+| 3 | `agh` | AdGuard Home 客户端列表 | `agh.conf` |
+| 4 | `ikuai` | 爱快 DHCP 租约表 | `ikuai.conf` |
+| 5 | `http` | 任意返回 JSON 的接口 | `DEV_HTTP_URL` |
+| 6 | `manual` | `devices.conf` 手写映射 | `devices.conf` |
+
+**后者覆盖前者**，所以 `manual` 的优先级最高。
+
+`DEVICE_PROVIDERS` 控制启用哪些：
+
+```bash
+# auto：启用所有探测到的（默认）
+DEVICE_PROVIDERS=auto
+
+# 只用指定的，顺序即优先级
+DEVICE_PROVIDERS=dnsmasq,agh,manual
+```
+
+**通用 HTTP provider** 支持两种返回格式：
+
+```json
+[{"ip": "192.168.1.10", "name": "我的电脑"}]
+```
+```json
+{"192.168.1.10": "我的电脑"}
+```
+
+自检：`curl http://localhost:8088/api/providers` 可以看到每个源拿到多少数据。
+
+### Docker 部署
+
+```bash
+docker compose up -d --build
+```
+
+然后打开 http://<宿主机IP>:8088 。首次使用进容器设密码：
+
+```bash
+docker exec -it mosdns-dashboard python tools/dashboard-setpass
+```
+
+**目录结构**：容器把数据库和配置写在 `DATA_DIR`（镜像内 `/app/data`），已挂成 named volume，重建镜像不丢数据。
+
+**local 模式**（默认）需要把 MosDNS 配置文件挂进去读上游清单：
+
+```yaml
+volumes:
+  - dashboard-data:/app/data
+  - /etc/mosdns/mosdns.json:/app/data/mosdns.json:ro
+```
+
+**SSH 模式**（MosDNS 在远端路由器）：
+
+```yaml
+environment:
+  MOSDNS_TRANSPORT: ssh
+  MOSDNS_HOST: 192.168.1.1
+volumes:
+  - ./data/id_ed25519_mosdns:/app/data/id_ed25519_mosdns:ro
+```
+
+镜像以非 root 用户（uid 10001）运行，装了 `tini` 作为 PID 1 处理信号。
+
+### 自动探测的内容
+
+不再需要手工指定的东西：
+
+- **MosDNS 配置文件**：按 `/var/etc/mosdns.json` → `/etc/mosdns.json` → `/etc/mosdns/mosdns.json` → `/usr/local/etc/mosdns.json` → `<安装目录>/mosdns.json` 顺序找
+- **局域网接口**：默认路由所在接口 → 候选列表（`br-lan` / `br0` / `eth0` / `eth1` / `ens18` / `ens19` / `enp1s0`）里邻居最多的
+- **MAC 地址来源**：`ip neigh`（自动接口 → 不限接口）→ `/proc/net/arp` → `arp -a`（Windows/macOS）
+- **邻居表格式**：BusyBox（`IP lladdr MAC`）和 iproute2（`IP dev X lladdr MAC`）都能解析
+- **Python 解释器**：ssh 模式下按 `python3` → `python` → `python3.12` → `python3.11` → `python3.10` 逐个尝试
+- **HTTP 请求**：`local` 模式用 `urllib`，不再依赖 `curl`；DNS 查询是标准库实现，不再依赖 `dig`
 
 建议写进 systemd drop-in（模板见 `deploy/mosdns-dashboard.service` 末尾注释）。
 
@@ -202,6 +317,63 @@ MosDNS 日志里的 `client` 确实是本机（dnsmasq 转进来的）。要真�
 
 **Q：支持 HEAD 请求吗？**
 支持。路由复用 `do_GET`，但响应头发完就不写 body；`/api/stream`（SSE 长连接）、`/api/clear`（会重置统计）、`/api/logout`（会注销 cookie）这三个例外直接返回 405，因为 HEAD 按规范必须是安全且无副作用的。
+
+---
+
+## 监控与运维
+
+### 健康检查
+
+```bash
+curl http://localhost:8088/healthz
+```
+
+判定分三层，避免把「可选集成没配」误判成「服务挂了」：
+
+| 层级 | 项目 | 说明 |
+|---|---|---|
+| 必需 | `database`、`disk` | 任一失败 → 503 |
+| 数据链路 | `ssh`、`mosdns` | 断开时服务降级但仍可访问（`status: degraded`） |
+| 可选 | `agh`、`ikuai` | 未配置文件时为 `null`，不参与就绪判定 |
+
+返回示例：
+
+```json
+{
+  "status": "degraded",
+  "ready": true,
+  "checks": {
+    "database": true, "disk": true,
+    "ssh": false, "mosdns": false,
+    "agh": null, "ikuai": null
+  }
+}
+```
+
+- `/healthz` 不需要登录态（k8s/Docker 探针带不了 cookie）
+- `/metrics` 同样免认证，但只暴露聚合数字，不含客户端身份
+
+### Prometheus 指标
+
+面板暴露标准 Prometheus 格式指标，可直接对接 Grafana：
+
+```bash
+curl http://localhost:8088/metrics
+```
+
+输出示例：
+```
+mosdns_queries_total 12345
+mosdns_cache_hits_total 8900
+mosdns_blocked_total 120
+mosdns_upstream_queries_total{upstream="8.8.8.8"} 5000
+mosdns_upstream_latency_ms{upstream="8.8.8.8"} 45.2
+```
+
+**Grafana 配置**：
+1. 添加 Prometheus 数据源，URL 填 `http://<面板主机>:8088`
+2. 导入社区 Dashboard 或自行创建面板
+3. 常用查询：`rate(mosdns_queries_total[5m])`、`mosdns_cache_hits_total / mosdns_queries_total`
 
 ---
 

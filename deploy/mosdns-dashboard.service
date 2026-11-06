@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# 路径用占位说明：请按实际安装位置替换（Docker 里通常是 /app）
 WorkingDirectory=/opt/mosdns-dashboard
 ExecStart=/usr/bin/python3 -u /opt/mosdns-dashboard/server.py
 Restart=on-failure
@@ -17,14 +18,35 @@ SyslogIdentifier=mosdns-dashboard
 WantedBy=multi-user.target
 
 # ---------------------------------------------------------------------------
-# 可选：把环境变量写进 drop-in（/etc/systemd/system/mosdns-dashboard.service.d/env.conf）
+# 取数方式（三选一，默认 auto）：
+#   auto  本机有 MosDNS 配置就直接读，否则走 SSH（兼容老部署，推荐）
+#   local 强制本机执行 —— MosDNS 与面板同机、Docker 部署
+#   ssh   强制 SSH —— 面板在另一台机器
 #
-# [Service]
-# Environment=MOSDNS_HOST=192.168.1.1
-# Environment=MOSDNS_SSH_KEY=/root/.ssh/id_ed25519_mosdns
-# Environment=DASH_PORT=8088
-# Environment=DASH_TLS_CERT=/opt/mosdns-dashboard/ssl/server.pem
-# Environment=DASH_TLS_KEY=/opt/mosdns-dashboard/ssl/server.key
+#   Environment=MOSDNS_TRANSPORT=auto
+#
+# SSH 模式需要的变量：
+#   Environment=MOSDNS_HOST=192.168.1.1
+#   Environment=MOSDNS_USER=root
+#   Environment=MOSDNS_SSH_PORT=22
+#   Environment=MOSDNS_SSH_KEY=/root/.ssh/id_ed25519_mosdns
+#
+# MosDNS API（默认 127.0.0.1:9091，换端口才需要改）：
+#   Environment=MOSDNS_API_ADDR=127.0.0.1:9091
+#   Environment=MOSDNS_API_PATH=/plugins/stats_collector/api/v1
+#   Environment=MOSDNS_PORT=5335
+#
+# MosDNS 配置文件位置（不配则按候选列表自动探测）：
+#   Environment=MOSDNS_CFG_PATH=/var/etc/mosdns.json
+#
+# 局域网接口（不配则自动探测：默认路由口 → 候选里邻居最多的）：
+#   Environment=LAN_IFACE=br-lan
+#
+# 其他：
+#   Environment=DASH_HOST=0.0.0.0
+#   Environment=DASH_PORT=8088
+#   Environment=DASH_TLS_CERT=/opt/mosdns-dashboard/ssl/server.pem
+#   Environment=DASH_TLS_KEY=/opt/mosdns-dashboard/ssl/server.key
 #
 # 改完执行：systemctl daemon-reload && systemctl restart mosdns-dashboard
 # ---------------------------------------------------------------------------

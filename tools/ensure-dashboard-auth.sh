@@ -4,8 +4,9 @@
 #             面板就会在公网上裸奔。认证必须写在 server.py 里才能拦请求，
 #             这里改不了代码，只能把风险喊进系统日志。
 set -u
-P=/opt/mosdns-dashboard/server.py
-A=/opt/mosdns-dashboard/auth.conf
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+P="${MOSDNS_DASH_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}/server.py"
+A="$(dirname "$P")/auth.conf"
 TAG=mosdns-dashboard
 
 [ -f "$P" ] || { echo "[auth] server.py 不存在，跳过"; exit 0; }

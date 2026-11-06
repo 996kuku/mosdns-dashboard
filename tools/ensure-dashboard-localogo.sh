@@ -2,8 +2,9 @@
 # 幂等地给 /opt/mosdns-dashboard/index.html 的 favSrcs 加上"本地 logo 优先"
 # 由 systemd 的 ExecStartPre=- 调用（"-" = 失败也不阻止服务启动）
 set -u
-H=/opt/mosdns-dashboard/index.html
-DIR=/opt/mosdns-dashboard/static/logo
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+H="${MOSDNS_DASH_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}/index.html"
+DIR="$(dirname "$H")/static/logo"
 
 [ -f "$H" ] || { echo "[logo] index.html 不存在，跳过"; exit 0; }
 grep -q "/static/logo/" "$H" && { echo "[logo] 已启用本地 logo 优先，跳过"; exit 0; }
