@@ -201,6 +201,40 @@ DEVICE_PROVIDERS=dnsmasq,agh,manual
 
 自检：`curl http://localhost:8088/api/providers` 可以看到每个源拿到多少数据。
 
+### Docker 部署
+
+```bash
+docker compose up -d --build
+```
+
+然后打开 http://<宿主机IP>:8088 。首次使用进容器设密码：
+
+```bash
+docker exec -it mosdns-dashboard python tools/dashboard-setpass
+```
+
+**目录结构**：容器把数据库和配置写在 `DATA_DIR`（镜像内 `/app/data`），已挂成 named volume，重建镜像不丢数据。
+
+**local 模式**（默认）需要把 MosDNS 配置文件挂进去读上游清单：
+
+```yaml
+volumes:
+  - dashboard-data:/app/data
+  - /etc/mosdns/mosdns.json:/app/data/mosdns.json:ro
+```
+
+**SSH 模式**（MosDNS 在远端路由器）：
+
+```yaml
+environment:
+  MOSDNS_TRANSPORT: ssh
+  MOSDNS_HOST: 192.168.1.1
+volumes:
+  - ./data/id_ed25519_mosdns:/app/data/id_ed25519_mosdns:ro
+```
+
+镜像以非 root 用户（uid 10001）运行，装了 `tini` 作为 PID 1 处理信号。
+
 ### 自动探测的内容
 
 不再需要手工指定的东西：

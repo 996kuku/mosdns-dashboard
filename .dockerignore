@@ -1,0 +1,35 @@
+# 构建上下文里排除这些，避免把宿主机的运行数据/私钥打进镜像
+.git
+.gitignore
+.gitattributes
+__pycache__
+*.pyc
+*.pyo
+
+# 运行数据：绝不能进镜像（logs.db 是真实 DNS 查询历史）
+logs.db
+logs.db-shm
+logs.db-wal
+*.db
+
+# 真实配置：只保留 *.example
+auth.conf
+agh.conf
+ikuai.conf
+devices.conf
+
+# 证书私钥
+ssl/
+*.pem
+*.key
+*.crt
+
+# 第三方 logo（版权 + 体积）
+static/logo/*
+!static/logo/.gitkeep
+
+# 文档与测试不需要进镜像
+docs/
+smoke_test.py
+README.md
+LICENSE

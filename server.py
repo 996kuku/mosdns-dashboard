@@ -122,11 +122,22 @@ AGH_PAGE = 500           # 单次从 AGH querylog 拉取的条数（它没有 50
 
 INDEX = os.path.join(HERE, "index.html")
 STATIC_DIR = os.path.join(HERE, "static")
-AGH_CONF = os.path.join(HERE, "agh.conf")
+
+# 运行数据（数据库、配置）的落点。
+# 默认与代码同目录（源码部署时最方便）；容器里指向挂载的 volume，
+# 这样重建镜像不会丢历史数据。
+DATA_DIR = os.environ.get("DATA_DIR", HERE)
+if not os.path.isdir(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        DATA_DIR = HERE          # 建不了就退回代码目录，至少能跑
+
+AGH_CONF = os.path.join(DATA_DIR, "agh.conf")
 # 设备名映射（可选）：一行一条 "192.168.1.200=我的台式机"，放在 devices.conf 里
-DEV_CONF = os.path.join(HERE, "devices.conf")
+DEV_CONF = os.path.join(DATA_DIR, "devices.conf")
 # 登录认证：auth.conf（AUTH_ENABLE=1 时生效；账号/密码哈希/会话密钥都在里面，权限 600）
-AUTH_CONF = os.path.join(HERE, "auth.conf")
+AUTH_CONF = os.path.join(DATA_DIR, "auth.conf")
 LOGIN_PAGE = os.path.join(HERE, "login.html")
 SESS_COOKIE = "mdash_sess"
 SESS_DAYS = 7                    # 登录状态保持天数
@@ -733,7 +744,7 @@ def _collect():
 # ---------- 日志累积 ----------
 # MosDNS 单次最多只吐 500 条（?limit=5000 也一样），要看 2000 条只能自己攒。
 # 后台线程每 INGEST_INTERVAL 秒拉一次，按 id 去重写进 SQLite，只保留最近 LOG_KEEP 条。
-DB_PATH = os.path.join(HERE, "logs.db")
+DB_PATH = os.path.join(DATA_DIR, "logs.db")
 _db_lock = threading.Lock()
 _conn = None
 
@@ -2086,7 +2097,7 @@ def collector_loop():
 # ---------- 面板基线（只影响本面板显示，绝不动路由器上的 MosDNS） ----------
 # 原理：点「清除」时把此刻的累计值记为基线，之后展示 当前值 - 基线值，
 # 相当于从那一刻重新开始计数。MosDNS 里的真实统计完全不被修改。
-BASELINE_FILE = os.path.join(HERE, "baseline.json")
+BASELINE_FILE = os.path.join(DATA_DIR, "baseline.json")
 _baseline = None
 _b_lock = threading.Lock()
 

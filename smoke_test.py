@@ -961,6 +961,35 @@ def test_no_curl_in_local_paths():
         return False
 
 
+def test_data_dir_configurable():
+    """测试 23：数据目录可配置（容器持久化用）"""
+    print("=" * 60)
+    print("测试 23：数据目录可配置")
+    print("=" * 60)
+
+    try:
+        # 默认应与代码同目录（源码部署行为不变）
+        assert server.DATA_DIR == server.HERE, \
+            f"默认 DATA_DIR 应等于 HERE，实际 {server.DATA_DIR}"
+        assert server.DB_PATH.startswith(server.HERE)
+        print(f"  默认 DATA_DIR = HERE = {server.HERE}")
+
+        # 关键文件应落在 DATA_DIR 下
+        for name in ("DB_PATH", "AGH_CONF", "DEV_CONF", "AUTH_CONF",
+                     "BASELINE_FILE"):
+            v = getattr(server, name)
+            assert v.startswith(server.DATA_DIR), f"{name} 不在 DATA_DIR 下: {v}"
+        print("  数据库与配置文件路径均跟随 DATA_DIR")
+
+        # 容器镜像里会设成 /app/data
+        print("  容器内默认 DATA_DIR=/app/data（见 Dockerfile）")
+        print("  ✓ 数据目录可配置，默认行为不变\n")
+        return True
+    except Exception as e:
+        print(f"  ✗ 失败: {e}\n")
+        return False
+
+
 def main():
     print("\n" + "=" * 60)
     print("MosDNS Dashboard 冒烟测试")
@@ -991,6 +1020,7 @@ def main():
     results.append(("HTTP 客户端零依赖", test_http_client_no_curl()))
     results.append(("指标解析无 grep", test_metrics_parsing_without_grep()))
     results.append(("local 路径无 curl", test_no_curl_in_local_paths()))
+    results.append(("数据目录可配置", test_data_dir_configurable()))
 
     # 汇总结果
     print("=" * 60)
